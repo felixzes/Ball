@@ -1,0 +1,1264 @@
+--[[
+    Lil0darkie6 Sphere v8 — Global Radius & Network Ownership Pull Engine
+    - Sweeps Workspace continuously for newly unanchored physics objects
+    - Forces simulation radius expansion to claim network ownership map-wide
+    - Dynamically updates network retention pool every heartbeat
+    - Mobile: drag sphere center via joystick
+    - Shape engine: Sphere / Ring / Grid / Helix — live switchable
+    + Fly system with wing animation — skibidi edition
+    + Outer pull ring — 10 studs beyond sphere radius, independent pull pool
+    + Force OBLITERATED — math.huge + responsiveness 2000 + per-frame velocity hammer
+    + Touch-to-Move mode — tap/drag anywhere, sphere follows touch world position
+    + Tab 2: Manipulation Panel — move/spin/freeze/explode/vacuum all claimed parts
+]]
+
+local Players          = game:GetService("Players")
+local RunService       = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local SoundService     = game:GetService("SoundService")
+local StarterGui       = game:GetService("StarterGui")
+local TextChatService  = game:GetService("TextChatService")
+local Workspace        = game:GetService("Workspace")
+local TweenService     = game:GetService("TweenService")
+local LocalPlayer      = Players.LocalPlayer
+
+local character        = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+local humanoidRootPart = character:WaitForChild("HumanoidRootPart")
+local humanoid         = character:WaitForChild("Humanoid")
+
+-- ─── Folder + Anchor ─────────────────────────────
+local Folder      = Instance.new("Folder", Workspace)
+local Part        = Instance.new("Part", Folder)
+Part.Anchored     = true
+Part.CanCollide   = false
+Part.Transparency = 1
+local Attachment1 = Instance.new("Attachment", Part)
+
+local staticCenterPosition = humanoidRootPart.Position
+Part.Position = staticCenterPosition
+
+-- ─── Network ─────────────────────────────────────
+if not getgenv().Network then
+    getgenv().Network = {
+        BaseParts = {},
+        Velocity  = Vector3.new(14.46262424, 14.46262424, 14.46262424),
+    }
+    local Network = getgenv().Network
+    Network.RetainPart = function(p)
+        if typeof(p) == "Instance" and p:IsA("BasePart") and p:IsDescendantOf(Workspace) then
+            if not table.find(Network.BaseParts, p) then
+                table.insert(Network.BaseParts, p)
+                p.CustomPhysicalProperties = PhysicalProperties.new(0,0,0,0,0)
+                p.CanCollide = false
+            end
+        end
+    end
+    local function EnablePartControl()
+        LocalPlayer.ReplicationFocus = Workspace
+        RunService.Heartbeat:Connect(function()
+            pcall(function()
+                sethiddenproperty(LocalPlayer, "SimulationRadius",    100000)
+                sethiddenproperty(LocalPlayer, "MaxSimulationRadius", 100000)
+            end)
+            for _, p in pairs(Network.BaseParts) do
+                if p:IsDescendantOf(Workspace) and p.Parent then
+                    p.Velocity = Network.Velocity
+                end
+            end
+        end)
+    end
+    EnablePartControl()
+end
+
+-- ─── Sound ───────────────────────────────────────
+local function playSound(soundId)
+    local sound = Instance.new("Sound")
+    sound.SoundId = "rbxassetid://" .. soundId
+    sound.Parent  = SoundService
+    sound:Play()
+    sound.Ended:Connect(function() sound:Destroy() end)
+end
+playSound("2865227271")
+
+-- ─── Shape State ─────────────────────────────────
+local SHAPES        = { "Sphere", "Ring", "Grid", "Helix" }
+local shapeIndex    = 1
+local radius        = 50
+local rotationSpeed = 0.5
+local gridSpacing   = 8
+local helixTurns    = 3
+local helixHeight   = 60
+
+-- ─── Target position resolver ────────────────────
+local function getTargetPosition(i, count, t, center)
+    local shape = SHAPES[shapeIndex]
+    if shape == "Sphere" then
+        local phi   = math.acos(1 - 2 * i / math.max(count, 1))
+        local theta = (math.pi * (1 + math.sqrt(5)) * i) + t
+        return Vector3.new(
+            center.X + radius * math.sin(phi) * math.cos(theta),
+            center.Y + radius * math.cos(phi),
+            center.Z + radius * math.sin(phi) * math.sin(theta)
+        )
+    elseif shape == "Ring" then
+        local angle = (2 * math.pi * i / math.max(count, 1)) + t
+        return Vector3.new(
+            center.X + radius * math.cos(angle),
+            center.Y,
+            center.Z + radius * math.sin(angle)
+        )
+    elseif shape == "Grid" then
+        local n    = math.ceil(count ^ (1/3))
+        local nx   = (i - 1) % n
+        local ny   = math.floor((i - 1) / n) % n
+        local nz   = math.floor((i - 1) / (n * n)) % n
+        local half = (n - 1) / 2
+        return Vector3.new(
+            center.X + (nx - half) * gridSpacing,
+            center.Y + (ny - half) * gridSpacing,
+            center.Z + (nz - half) * gridSpacing
+        )
+    elseif shape == "Helix" then
+        local frac  = i / math.max(count, 1)
+        local angle = frac * helixTurns * 2 * math.pi + t
+        return Vector3.new(
+            center.X + radius * math.cos(angle),
+            center.Y - helixHeight / 2 + frac * helixHeight,
+            center.Z + radius * math.sin(angle)
+        )
+    end
+    return center
+end
+
+-- ═══════════════════════════════════════════════════════
+-- ─── OUTER PULL RING ─────────────────────────────────
+-- ═══════════════════════════════════════════════════════
+local RING_COUNT      = 12
+local RING_OFFSET     = 10
+local RING_PULL_FORCE = math.huge
+local RING_PULL_RESP  = 2000
+local ringEnabled     = false
+local ringAngle       = 0
+local ringNodes       = {}
+local ringPool        = {}
+local ringParts       = {}
+local parts           = {}
+local partAngles      = {}
+
+local function removePartFromRing(part)
+    local idx = table.find(ringParts, part)
+    if idx then table.remove(ringParts, idx); ringPool[part] = nil end
+end
+
+local function buildRingNodes()
+    for i = 1, RING_COUNT do
+        local anchor        = Instance.new("Part", Folder)
+        anchor.Anchored     = true
+        anchor.CanCollide   = false
+        anchor.Transparency = 1
+        anchor.Size         = Vector3.new(1, 1, 1)
+        anchor.Position     = staticCenterPosition
+        local att           = Instance.new("Attachment", anchor)
+        ringNodes[i]        = { anchor = anchor, att = att }
+    end
+end
+
+local function destroyRingNodes()
+    for _, node in ipairs(ringNodes) do
+        if node.anchor and node.anchor.Parent then node.anchor:Destroy() end
+    end
+    ringNodes = {}; ringPool = {}; ringParts = {}
+end
+
+local function updateRingNodePositions(center, r)
+    local ringRadius = r + RING_OFFSET
+    for i, node in ipairs(ringNodes) do
+        local angle = ringAngle + (2 * math.pi * (i - 1) / RING_COUNT)
+        node.anchor.Position = Vector3.new(
+            center.X + ringRadius * math.cos(angle),
+            center.Y,
+            center.Z + ringRadius * math.sin(angle)
+        )
+    end
+end
+
+local function forcePartToRingNode(part, nodeIndex)
+    local node = ringNodes[nodeIndex]
+    if not node then return end
+    for _, x in next, part:GetChildren() do
+        if x:IsA("BodyAngularVelocity") or x:IsA("BodyForce") or x:IsA("BodyGyro")
+           or x:IsA("BodyPosition") or x:IsA("BodyThrust") or x:IsA("BodyVelocity")
+           or x:IsA("RocketPropulsion") then x:Destroy() end
+    end
+    if part:FindFirstChild("RingAttachment")    then part:FindFirstChild("RingAttachment"):Destroy()    end
+    if part:FindFirstChild("RingAlignPosition") then part:FindFirstChild("RingAlignPosition"):Destroy() end
+    if part:FindFirstChild("RingTorque")        then part:FindFirstChild("RingTorque"):Destroy()        end
+    part.CanCollide    = false
+    local partAtt      = Instance.new("Attachment", part)
+    partAtt.Name       = "RingAttachment"
+    local torque       = Instance.new("Torque", part)
+    torque.Name        = "RingTorque"
+    torque.Torque      = Vector3.new(100000, 100000, 100000)
+    torque.Attachment0 = partAtt
+    local ap           = Instance.new("AlignPosition", part)
+    ap.Name            = "RingAlignPosition"
+    ap.MaxForce        = RING_PULL_FORCE
+    ap.MaxVelocity     = math.huge
+    ap.Responsiveness  = RING_PULL_RESP
+    ap.Attachment0     = partAtt
+    ap.Attachment1     = node.att
+    ap.Parent          = part
+end
+
+local function isEligibleForRing(part)
+    if not part:IsA("BasePart") then return false end
+    if part.Anchored then return false end
+    if not part:IsDescendantOf(Workspace) then return false end
+    if part:IsDescendantOf(Folder) then return false end
+    if LocalPlayer.Character and part:IsDescendantOf(LocalPlayer.Character) then return false end
+    local ancestor = part.Parent
+    while ancestor and ancestor ~= Workspace do
+        if ancestor:FindFirstChild("Humanoid") or ancestor:FindFirstChild("Head") then return false end
+        ancestor = ancestor.Parent
+    end
+    return true
+end
+
+local function addPartToRing(part)
+    if not ringEnabled then return end
+    if not isEligibleForRing(part) then return end
+    if table.find(parts, part) then return end
+    if table.find(ringParts, part) then return end
+    if getgenv().Network then getgenv().Network.RetainPart(part) end
+    table.insert(ringParts, part)
+    local nodeIndex = ((#ringParts - 1) % RING_COUNT) + 1
+    ringPool[part]  = nodeIndex
+    forcePartToRingNode(part, nodeIndex)
+end
+
+local function enableRing()
+    ringEnabled = true
+    buildRingNodes()
+    updateRingNodePositions(staticCenterPosition, radius)
+    for _, obj in ipairs(Workspace:GetDescendants()) do addPartToRing(obj) end
+end
+
+local function disableRing()
+    ringEnabled = false
+    for _, part in ipairs(ringParts) do
+        if part and part.Parent then
+            if part:FindFirstChild("RingAttachment")    then part:FindFirstChild("RingAttachment"):Destroy()    end
+            if part:FindFirstChild("RingAlignPosition") then part:FindFirstChild("RingAlignPosition"):Destroy() end
+            if part:FindFirstChild("RingTorque")        then part:FindFirstChild("RingTorque"):Destroy()        end
+        end
+    end
+    destroyRingNodes()
+end
+
+RunService.Heartbeat:Connect(function(dt)
+    if not ringEnabled then return end
+    ringAngle = ringAngle + dt * rotationSpeed
+    updateRingNodePositions(staticCenterPosition, radius)
+    for _, obj in ipairs(Workspace:GetDescendants()) do addPartToRing(obj) end
+end)
+
+Workspace.DescendantAdded:Connect(function(obj)
+    if ringEnabled then addPartToRing(obj) end
+end)
+Workspace.DescendantRemoving:Connect(removePartFromRing)
+
+-- ═══════════════════════════════════════════════════════
+-- ─── TOUCH TO MOVE ───────────────────────────────────
+-- ═══════════════════════════════════════════════════════
+local TOUCH_MOVE_ENABLED = false
+local activeTouches      = {}
+
+local function screenToWorld(screenPos)
+    local cam = Workspace.CurrentCamera
+    if not cam then return nil end
+    local unitRay = cam:ScreenPointToRay(screenPos.X, screenPos.Y)
+    local planeY  = humanoidRootPart and humanoidRootPart.Position.Y or staticCenterPosition.Y
+    local origin  = unitRay.Origin
+    local dir     = unitRay.Direction
+    if math.abs(dir.Y) < 0.0001 then return origin + dir * 100 end
+    local t = (planeY - origin.Y) / dir.Y
+    if t < 0 then return origin + dir * 100 end
+    return origin + dir * t
+end
+
+local function applyTouchMove(screenPos)
+    local worldPos = screenToWorld(screenPos)
+    if not worldPos then return end
+    staticCenterPosition = Vector3.new(worldPos.X, staticCenterPosition.Y, worldPos.Z)
+    Part.Position        = staticCenterPosition
+end
+
+local TouchOverlay = Instance.new("Frame")
+TouchOverlay.Size                   = UDim2.new(1, 0, 1, 0)
+TouchOverlay.Position               = UDim2.new(0, 0, 0, 0)
+TouchOverlay.BackgroundTransparency = 1
+TouchOverlay.BorderSizePixel        = 0
+TouchOverlay.ZIndex                 = 1
+TouchOverlay.Visible                = false
+TouchOverlay.Parent                 = nil
+
+local function connectTouchOverlay(screenGui)
+    TouchOverlay.Parent = screenGui
+    TouchOverlay.InputBegan:Connect(function(input)
+        if not TOUCH_MOVE_ENABLED then return end
+        if input.UserInputType ~= Enum.UserInputType.Touch
+        and input.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
+        activeTouches[input] = true
+        applyTouchMove(Vector2.new(input.Position.X, input.Position.Y))
+    end)
+    TouchOverlay.InputChanged:Connect(function(input)
+        if not TOUCH_MOVE_ENABLED then return end
+        if not activeTouches[input] then return end
+        if input.UserInputType ~= Enum.UserInputType.Touch
+        and input.UserInputType ~= Enum.UserInputType.MouseMovement then return end
+        applyTouchMove(Vector2.new(input.Position.X, input.Position.Y))
+    end)
+    TouchOverlay.InputEnded:Connect(function(input)
+        activeTouches[input] = nil
+    end)
+end
+
+-- ═══════════════════════════════════════════════════════
+-- ─── MANIPULATION STATE ──────────────────────────────
+-- ═══════════════════════════════════════════════════════
+local MANIP_SPIN_ENABLED   = false
+local MANIP_FREEZE_ENABLED = false
+local MANIP_SPIN_SPEED     = 200
+local NUDGE_AMT            = 50
+
+local function getClaimedParts()
+    if getgenv().Network then
+        local live = {}
+        for _, p in ipairs(getgenv().Network.BaseParts) do
+            if p and p.Parent and p:IsDescendantOf(Workspace) then
+                table.insert(live, p)
+            end
+        end
+        return live
+    end
+    return parts
+end
+
+local function nudgeAll(dir, amount)
+    for _, p in ipairs(getClaimedParts()) do
+        if p and p.Parent then
+            pcall(function() p.Velocity = p.Velocity + dir * amount end)
+        end
+    end
+end
+
+RunService.Heartbeat:Connect(function()
+    if not MANIP_FREEZE_ENABLED then return end
+    for _, p in ipairs(getClaimedParts()) do
+        if p and p.Parent then
+            pcall(function()
+                p.Velocity    = Vector3.zero
+                p.RotVelocity = Vector3.zero
+            end)
+        end
+    end
+end)
+
+RunService.Heartbeat:Connect(function()
+    if not MANIP_SPIN_ENABLED then return end
+    for _, p in ipairs(getClaimedParts()) do
+        if p and p.Parent then
+            pcall(function()
+                p.RotVelocity = Vector3.new(MANIP_SPIN_SPEED, MANIP_SPIN_SPEED, MANIP_SPIN_SPEED)
+            end)
+        end
+    end
+end)
+
+-- ═══════════════════════════════════════════════════════
+-- ─── GUI ─────────────────────────────────────────────
+-- ═══════════════════════════════════════════════════════
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name         = "Lil0darkie6RingsGUI"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.Parent       = LocalPlayer:WaitForChild("PlayerGui")
+
+connectTouchOverlay(ScreenGui)
+
+local PANEL_W = 260
+local PANEL_H = 556
+
+local PanelContainer = Instance.new("Frame")
+PanelContainer.Size                   = UDim2.new(0, PANEL_W, 0, PANEL_H + 36)
+PanelContainer.Position               = UDim2.new(0.5, -(PANEL_W/2), 0.5, -((PANEL_H+36)/2))
+PanelContainer.BackgroundTransparency = 1
+PanelContainer.BorderSizePixel        = 0
+PanelContainer.ZIndex                 = 9
+PanelContainer.Parent                 = ScreenGui
+
+local TabBar = Instance.new("Frame")
+TabBar.Size             = UDim2.new(1, 0, 0, 36)
+TabBar.Position         = UDim2.new(0, 0, 0, 0)
+TabBar.BackgroundColor3 = Color3.fromRGB(0, 80, 40)
+TabBar.BorderSizePixel  = 0
+TabBar.ZIndex           = 10
+TabBar.Parent           = PanelContainer
+Instance.new("UICorner", TabBar).CornerRadius = UDim.new(0, 12)
+
+local TabLayout = Instance.new("UIListLayout")
+TabLayout.FillDirection       = Enum.FillDirection.Horizontal
+TabLayout.HorizontalAlignment = Enum.HorizontalAlignment.Left
+TabLayout.VerticalAlignment   = Enum.VerticalAlignment.Center
+TabLayout.Padding             = UDim.new(0, 4)
+TabLayout.Parent              = TabBar
+
+local TabPad = Instance.new("UIPadding")
+TabPad.PaddingLeft = UDim.new(0, 6)
+TabPad.Parent      = TabBar
+
+local function makeTab(label)
+    local btn = Instance.new("TextButton")
+    btn.Size             = UDim2.new(0, 110, 0, 28)
+    btn.BackgroundColor3 = Color3.fromRGB(0, 120, 60)
+    btn.TextColor3       = Color3.fromRGB(255, 255, 255)
+    btn.Text             = label
+    btn.Font             = Enum.Font.Fondamento
+    btn.TextSize         = 13
+    btn.AutoButtonColor  = false
+    btn.ZIndex           = 11
+    btn.Parent           = TabBar
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 8)
+    return btn
+end
+
+local Tab1Btn = makeTab("⚙  Sphere")
+local Tab2Btn = makeTab("✦  Manipulate")
+
+local function makePanel()
+    local f = Instance.new("Frame")
+    f.Size             = UDim2.new(1, 0, 0, PANEL_H)
+    f.Position         = UDim2.new(0, 0, 0, 36)
+    f.BackgroundColor3 = Color3.fromRGB(0, 102, 51)
+    f.BorderSizePixel  = 0
+    f.ZIndex           = 10
+    f.Parent           = PanelContainer
+    Instance.new("UICorner", f).CornerRadius = UDim.new(0, 20)
+    return f
+end
+
+local MainFrame  = makePanel()
+local ManipFrame = makePanel()
+ManipFrame.Visible = false
+
+local function setTab(idx)
+    MainFrame.Visible  = (idx == 1)
+    ManipFrame.Visible = (idx == 2)
+    Tab1Btn.BackgroundColor3 = idx == 1 and Color3.fromRGB(50,205,50) or Color3.fromRGB(0,120,60)
+    Tab2Btn.BackgroundColor3 = idx == 2 and Color3.fromRGB(50,205,50) or Color3.fromRGB(0,120,60)
+end
+
+Tab1Btn.MouseButton1Click:Connect(function() setTab(1); playSound("12221967") end)
+Tab2Btn.MouseButton1Click:Connect(function() setTab(2); playSound("12221967") end)
+setTab(1)
+
+local function makeLabel(parent, text, y, w, x)
+    w = w or 1; x = x or 0
+    local L = Instance.new("TextLabel")
+    L.Size                   = UDim2.new(w, -8, 0, 18)
+    L.Position               = UDim2.new(x, 4, 0, y)
+    L.Text                   = text
+    L.TextColor3             = Color3.fromRGB(220, 220, 220)
+    L.BackgroundTransparency = 1
+    L.Font                   = Enum.Font.Fondamento
+    L.TextSize               = 12
+    L.TextXAlignment         = Enum.TextXAlignment.Left
+    L.ZIndex                 = 11
+    L.Parent                 = parent
+    return L
+end
+
+local function makeButton(parent, text, y, w, x, bg, tc)
+    w  = w  or 0.8; x  = x  or 0.1
+    bg = bg or Color3.fromRGB(0, 153, 76)
+    tc = tc or Color3.fromRGB(255, 255, 255)
+    local B = Instance.new("TextButton")
+    B.Size             = UDim2.new(w, 0, 0, 28)
+    B.Position         = UDim2.new(x, 0, 0, y)
+    B.Text             = text
+    B.BackgroundColor3 = bg
+    B.TextColor3       = tc
+    B.Font             = Enum.Font.Fondamento
+    B.TextSize         = 13
+    B.ZIndex           = 11
+    B.Parent           = parent
+    Instance.new("UICorner", B).CornerRadius = UDim.new(0, 10)
+    return B
+end
+
+local function makeStepper(parent, labelText, y, getValue, onInc, onDec)
+    makeLabel(parent, labelText, y)
+    local dec  = makeButton(parent, "-", y+16, 0.2, 0.1, Color3.fromRGB(200,80,0),  Color3.fromRGB(255,255,255))
+    local disp = Instance.new("TextLabel")
+    disp.Size             = UDim2.new(0.4, 0, 0, 28)
+    disp.Position         = UDim2.new(0.3, 0, 0, y+16)
+    disp.Text             = tostring(getValue())
+    disp.BackgroundColor3 = Color3.fromRGB(20, 60, 30)
+    disp.TextColor3       = Color3.fromRGB(255, 255, 255)
+    disp.Font             = Enum.Font.Fondamento
+    disp.TextSize         = 13
+    disp.ZIndex           = 11
+    disp.Parent           = parent
+    Instance.new("UICorner", disp).CornerRadius = UDim.new(0, 8)
+    local inc = makeButton(parent, "+", y+16, 0.2, 0.7, Color3.fromRGB(0,180,80), Color3.fromRGB(255,255,255))
+    dec.MouseButton1Click:Connect(function() onDec(); disp.Text = tostring(getValue()); playSound("12221967") end)
+    inc.MouseButton1Click:Connect(function() onInc(); disp.Text = tostring(getValue()); playSound("12221967") end)
+    return disp
+end
+
+-- ═══════════════════════════════════════════════════════
+-- ─── TAB 1 — SPHERE PANEL ────────────────────────────
+-- ═══════════════════════════════════════════════════════
+local Title1 = Instance.new("TextLabel")
+Title1.Size             = UDim2.new(1, 0, 0, 36)
+Title1.Position         = UDim2.new(0, 0, 0, 0)
+Title1.Text             = "Lil0darkie6 Sphere"
+Title1.TextColor3       = Color3.fromRGB(255, 255, 255)
+Title1.BackgroundColor3 = Color3.fromRGB(0, 153, 76)
+Title1.Font             = Enum.Font.Fondamento
+Title1.TextSize         = 17
+Title1.ZIndex           = 11
+Title1.Parent           = MainFrame
+Instance.new("UICorner", Title1).CornerRadius = UDim.new(0, 20)
+
+local MinimizeButton    = makeButton(MainFrame, "-", 4, 0, 0, Color3.fromRGB(0,200,80))
+MinimizeButton.Size     = UDim2.new(0, 28, 0, 28)
+MinimizeButton.Position = UDim2.new(1, -32, 0, 4)
+
+local ToggleButton   = makeButton(MainFrame, "Sphere Off",       42,  0.8, 0.1, Color3.fromRGB(255,0,0))
+local LockPosButton  = makeButton(MainFrame, "Set Center To Me", 76,  0.8, 0.1, Color3.fromRGB(0,150,255))
+
+makeLabel(MainFrame, "Shape", 112)
+local ShapeLeft = makeButton(MainFrame, "<", 128, 0.15, 0.05, Color3.fromRGB(80,80,160))
+local ShapeDisp = Instance.new("TextLabel")
+ShapeDisp.Size             = UDim2.new(0.6, 0, 0, 28)
+ShapeDisp.Position         = UDim2.new(0.2, 0, 0, 128)
+ShapeDisp.Text             = SHAPES[shapeIndex]
+ShapeDisp.BackgroundColor3 = Color3.fromRGB(20, 60, 30)
+ShapeDisp.TextColor3       = Color3.fromRGB(255, 255, 255)
+ShapeDisp.Font             = Enum.Font.Fondamento
+ShapeDisp.TextSize         = 14
+ShapeDisp.ZIndex           = 11
+ShapeDisp.Parent           = MainFrame
+Instance.new("UICorner", ShapeDisp).CornerRadius = UDim.new(0, 8)
+local ShapeRight = makeButton(MainFrame, ">", 128, 0.15, 0.8, Color3.fromRGB(80,80,160))
+
+ShapeLeft.MouseButton1Click:Connect(function()
+    shapeIndex = ((shapeIndex - 2) % #SHAPES) + 1
+    ShapeDisp.Text = SHAPES[shapeIndex]; playSound("12221967")
+end)
+ShapeRight.MouseButton1Click:Connect(function()
+    shapeIndex = (shapeIndex % #SHAPES) + 1
+    ShapeDisp.Text = SHAPES[shapeIndex]; playSound("12221967")
+end)
+
+makeLabel(MainFrame, "Radius", 162)
+local radDec  = makeButton(MainFrame, "-", 178, 0.2, 0.1, Color3.fromRGB(200,80,0))
+local radDisp = Instance.new("TextBox")
+radDisp.Size             = UDim2.new(0.4, 0, 0, 28)
+radDisp.Position         = UDim2.new(0.3, 0, 0, 178)
+radDisp.Text             = tostring(radius)
+radDisp.BackgroundColor3 = Color3.fromRGB(20, 60, 30)
+radDisp.TextColor3       = Color3.fromRGB(255, 255, 255)
+radDisp.Font             = Enum.Font.Fondamento
+radDisp.TextSize         = 13
+radDisp.ClearTextOnFocus = false
+radDisp.ZIndex           = 11
+radDisp.Parent           = MainFrame
+Instance.new("UICorner", radDisp).CornerRadius = UDim.new(0, 8)
+local radInc = makeButton(MainFrame, "+", 178, 0.2, 0.7, Color3.fromRGB(0,180,80))
+
+radDec.MouseButton1Click:Connect(function()
+    radius = math.max(1, radius - 5); radDisp.Text = tostring(radius); playSound("12221967")
+end)
+radInc.MouseButton1Click:Connect(function()
+    radius = math.min(100000, radius + 5); radDisp.Text = tostring(radius); playSound("12221967")
+end)
+radDisp.FocusLost:Connect(function()
+    local v = tonumber(radDisp.Text)
+    if v then radius = math.clamp(v, 1, 100000) end
+    radDisp.Text = tostring(radius); playSound("12221967")
+end)
+
+makeStepper(MainFrame, "Grid Spacing", 214,
+    function() return gridSpacing end,
+    function() gridSpacing = math.min(200, gridSpacing + 1) end,
+    function() gridSpacing = math.max(1,   gridSpacing - 1) end
+)
+makeStepper(MainFrame, "Helix Turns", 262,
+    function() return helixTurns end,
+    function() helixTurns = math.min(20, helixTurns + 1) end,
+    function() helixTurns = math.max(1,  helixTurns - 1) end
+)
+makeStepper(MainFrame, "Helix Height", 310,
+    function() return helixHeight end,
+    function() helixHeight = math.min(500, helixHeight + 10) end,
+    function() helixHeight = math.max(10,  helixHeight - 10) end
+)
+
+local StealButton     = makeButton(MainFrame, "Steal: Off",      358, 0.8, 0.1, Color3.fromRGB(180,0,0))
+local RingButton      = makeButton(MainFrame, "Pull Ring: Off",  392, 0.8, 0.1, Color3.fromRGB(100,0,200))
+local TouchMoveButton = makeButton(MainFrame, "Touch Move: Off", 426, 0.8, 0.1, Color3.fromRGB(0,100,180))
+local FlyButton       = makeButton(MainFrame, "Fly: Off",        460, 0.8, 0.1, Color3.fromRGB(80,0,180))
+
+local flySpeed = 60
+makeStepper(MainFrame, "Fly Speed", 494,
+    function() return flySpeed end,
+    function() flySpeed = math.min(500, flySpeed + 10) end,
+    function() flySpeed = math.max(10,  flySpeed - 10) end
+)
+
+local Watermark1 = Instance.new("TextLabel")
+Watermark1.Size                   = UDim2.new(1, 0, 0, 16)
+Watermark1.Position               = UDim2.new(0, 0, 1, -18)
+Watermark1.Text                   = "Lil0darkie6 Sphere [Static Sync] by Zeus!"
+Watermark1.TextColor3             = Color3.fromRGB(200, 200, 200)
+Watermark1.BackgroundTransparency = 1
+Watermark1.Font                   = Enum.Font.Fondamento
+Watermark1.TextSize               = 11
+Watermark1.ZIndex                 = 11
+Watermark1.Parent                 = MainFrame
+
+local minimized = false
+MinimizeButton.MouseButton1Click:Connect(function()
+    minimized              = not minimized
+    MinimizeButton.Text    = minimized and "+" or "-"
+    TabBar.Visible         = not minimized
+    MainFrame.Visible      = not minimized
+    ManipFrame.Visible     = false
+    PanelContainer.Size    = minimized
+        and UDim2.new(0, PANEL_W, 0, 40)
+        or  UDim2.new(0, PANEL_W, 0, PANEL_H + 36)
+    if not minimized then setTab(1) end
+end)
+
+-- ─── Frame Drag ──────────────────────────────────
+local dragging, dragInput, dragStart, startPos
+PanelContainer.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+    or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = true; dragStart = input.Position; startPos = PanelContainer.Position
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then dragging = false end
+        end)
+    end
+end)
+PanelContainer.InputChanged:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseMovement
+    or input.UserInputType == Enum.UserInputType.Touch then
+        dragInput = input
+    end
+end)
+UserInputService.InputChanged:Connect(function(input)
+    if input == dragInput and dragging then
+        local delta = input.Position - dragStart
+        PanelContainer.Position = UDim2.new(
+            startPos.X.Scale, startPos.X.Offset + delta.X,
+            startPos.Y.Scale, startPos.Y.Offset + delta.Y
+        )
+    end
+end)
+
+-- ─── Joystick ────────────────────────────────────
+local DragPad = Instance.new("Frame")
+DragPad.Size                   = UDim2.new(0, 120, 0, 120)
+DragPad.Position               = UDim2.new(1, -140, 1, -140)
+DragPad.BackgroundColor3       = Color3.fromRGB(255, 255, 255)
+DragPad.BackgroundTransparency = 0.7
+DragPad.BorderSizePixel        = 0
+DragPad.ZIndex                 = 10
+DragPad.Parent                 = ScreenGui
+Instance.new("UICorner", DragPad).CornerRadius = UDim.new(1, 0)
+
+local DragKnob = Instance.new("Frame")
+DragKnob.Size                   = UDim2.new(0, 44, 0, 44)
+DragKnob.Position               = UDim2.new(0.5, -22, 0.5, -22)
+DragKnob.BackgroundColor3       = Color3.fromRGB(0, 200, 120)
+DragKnob.BackgroundTransparency = 0.2
+DragKnob.BorderSizePixel        = 0
+DragKnob.ZIndex                 = 11
+DragKnob.Parent                 = DragPad
+Instance.new("UICorner", DragKnob).CornerRadius = UDim.new(1, 0)
+
+local DragLabel = Instance.new("TextLabel")
+DragLabel.Size                   = UDim2.new(1, 0, 0, 16)
+DragLabel.Position               = UDim2.new(0, 0, 1, 4)
+DragLabel.Text                   = "drag sphere"
+DragLabel.TextColor3             = Color3.fromRGB(255, 255, 255)
+DragLabel.BackgroundTransparency = 1
+DragLabel.Font                   = Enum.Font.Fondamento
+DragLabel.TextSize               = 12
+DragLabel.ZIndex                 = 11
+DragLabel.Parent                 = DragPad
+
+local joystickActive  = false
+local joystickTouchId = nil
+local joystickOrigin  = Vector2.new()
+local joystickDelta   = Vector2.new()
+local JOYSTICK_RADIUS   = 50
+local SPHERE_MOVE_SPEED = 0.6
+
+local function applyJoystickDelta(dt)
+    if not joystickActive then return end
+    local cam     = Workspace.CurrentCamera
+    local camCF   = cam and cam.CFrame or CFrame.new()
+    local forward = Vector3.new(camCF.LookVector.X, 0, camCF.LookVector.Z).Unit
+    local right   = Vector3.new(camCF.RightVector.X, 0, camCF.RightVector.Z).Unit
+    local move    = (right * joystickDelta.X + forward * (-joystickDelta.Y)) * SPHERE_MOVE_SPEED * dt
+    staticCenterPosition = staticCenterPosition + move
+    Part.Position        = staticCenterPosition
+end
+
+local function clampKnob(delta)
+    local mag = delta.Magnitude
+    return mag > JOYSTICK_RADIUS and (delta / mag * JOYSTICK_RADIUS) or delta
+end
+
+local function updateKnob(screenDelta)
+    local clamped     = clampKnob(screenDelta)
+    joystickDelta     = clamped
+    DragKnob.Position = UDim2.new(0.5, clamped.X - 22, 0.5, clamped.Y - 22)
+end
+
+local function resetKnob()
+    joystickActive = false; joystickTouchId = nil; joystickDelta = Vector2.new()
+    DragKnob.Position = UDim2.new(0.5, -22, 0.5, -22)
+end
+
+DragPad.InputBegan:Connect(function(input)
+    if (input.UserInputType == Enum.UserInputType.Touch
+    or  input.UserInputType == Enum.UserInputType.MouseButton1) and not joystickActive then
+        joystickActive = true; joystickTouchId = input
+        joystickOrigin = Vector2.new(input.Position.X, input.Position.Y)
+    end
+end)
+UserInputService.InputChanged:Connect(function(input)
+    if joystickActive and input == joystickTouchId then
+        updateKnob(Vector2.new(input.Position.X, input.Position.Y) - joystickOrigin)
+    end
+end)
+UserInputService.InputEnded:Connect(function(input)
+    if input == joystickTouchId then resetKnob() end
+end)
+RunService.Heartbeat:Connect(function(dt) applyJoystickDelta(dt) end)
+
+-- ─── Part Pool ───────────────────────────────────
+local sphereEnabled      = false
+local STEAL_ENABLED      = false
+-- !! force values — obliterated
+local attractionStrength = 9e8
+local STEAL_STRENGTH     = 9e8
+
+local function ForcePart(v)
+    if v:IsA("BasePart")
+    and not v.Parent:FindFirstChild("Humanoid")
+    and not v.Parent:FindFirstChild("Head")
+    and v.Name ~= "Handle" then
+        for _, x in next, v:GetChildren() do
+            if x:IsA("BodyAngularVelocity") or x:IsA("BodyForce") or x:IsA("BodyGyro")
+            or x:IsA("BodyPosition") or x:IsA("BodyThrust") or x:IsA("BodyVelocity")
+            or x:IsA("RocketPropulsion") then x:Destroy() end
+        end
+        if v:FindFirstChild("Attachment")    then v:FindFirstChild("Attachment"):Destroy()    end
+        if v:FindFirstChild("AlignPosition") then v:FindFirstChild("AlignPosition"):Destroy() end
+        if v:FindFirstChild("Torque")        then v:FindFirstChild("Torque"):Destroy()        end
+        v.CanCollide        = false
+        -- zero mass so physics resists nothing
+        v.CustomPhysicalProperties = PhysicalProperties.new(0, 0, 0, 0, 0)
+        local Torque        = Instance.new("Torque", v)
+        Torque.Torque       = Vector3.new(100000, 100000, 100000)
+        local Attachment2   = Instance.new("Attachment", v)
+        Torque.Attachment0  = Attachment2
+        local AlignPosition          = Instance.new("AlignPosition", v)
+        AlignPosition.MaxForce       = math.huge
+        AlignPosition.MaxVelocity    = math.huge
+        AlignPosition.Responsiveness = 2000
+        AlignPosition.Attachment0    = Attachment2
+        AlignPosition.Attachment1    = Attachment1
+    end
+end
+
+local function isEligiblePart(part)
+    if not part:IsA("BasePart") then return false end
+    if part.Anchored then return false end
+    if not part:IsDescendantOf(Workspace) then return false end
+    if part:IsDescendantOf(Folder) then return false end
+    if LocalPlayer.Character and part:IsDescendantOf(LocalPlayer.Character) then return false end
+    local ancestor = part.Parent
+    while ancestor and ancestor ~= Workspace do
+        if ancestor:FindFirstChild("Humanoid") or ancestor:FindFirstChild("Head") then return false end
+        ancestor = ancestor.Parent
+    end
+    return true
+end
+
+local function addPart(part)
+    if isEligiblePart(part) and not table.find(parts, part) then
+        if getgenv().Network then getgenv().Network.RetainPart(part) end
+        ForcePart(part)
+        table.insert(parts, part)
+        local idx = #parts
+        partAngles[part] = {
+            phi   = math.acos(1 - 2 * idx / math.max(idx, 1)),
+            theta = math.pi * (1 + math.sqrt(5)) * idx
+        }
+    end
+end
+
+local function removePart(part)
+    local idx = table.find(parts, part)
+    if idx then table.remove(parts, idx); partAngles[part] = nil end
+    removePartFromRing(part)
+end
+
+for _, obj in ipairs(Workspace:GetDescendants()) do addPart(obj) end
+Workspace.DescendantAdded:Connect(addPart)
+Workspace.DescendantRemoving:Connect(removePart)
+
+RunService.Stepped:Connect(function()
+    for _, part in ipairs(Workspace:GetDescendants()) do
+        if part:IsA("BasePart") and not part.Anchored then addPart(part) end
+    end
+end)
+
+-- ─── Shape Engine ─────────────────────────────────
+-- per-frame velocity hammer on top of AlignPosition
+local t = 0
+RunService.Heartbeat:Connect(function(dt)
+    if not sphereEnabled then return end
+    t = t + dt * rotationSpeed
+    local center = staticCenterPosition
+    local count  = #parts
+    for i, part in ipairs(parts) do
+        if part.Parent and not part.Anchored then
+            local target = getTargetPosition(i, count, t, center)
+            local dir    = target - part.Position
+            local dist   = dir.Magnitude
+            if dist > 0 then
+                -- scale velocity by distance: closer parts still get hammered
+                local speed = attractionStrength * math.max(1, dist * 0.1)
+                part.Velocity = (dir / dist) * speed
+            end
+        end
+    end
+end)
+
+-- ═══════════════════════════════════════════════════════
+-- ─── TAB 2 — MANIPULATION PANEL ──────────────────────
+-- ═══════════════════════════════════════════════════════
+local Title2 = Instance.new("TextLabel")
+Title2.Size             = UDim2.new(1, 0, 0, 36)
+Title2.Position         = UDim2.new(0, 0, 0, 0)
+Title2.Text             = "Part Manipulator"
+Title2.TextColor3       = Color3.fromRGB(255, 255, 255)
+Title2.BackgroundColor3 = Color3.fromRGB(0, 100, 160)
+Title2.Font             = Enum.Font.Fondamento
+Title2.TextSize         = 17
+Title2.ZIndex           = 11
+Title2.Parent           = ManipFrame
+Instance.new("UICorner", Title2).CornerRadius = UDim.new(0, 20)
+
+local CountLabel = makeLabel(ManipFrame, "Claimed: 0 parts", 44)
+CountLabel.TextSize = 13
+
+RunService.Heartbeat:Connect(function()
+    if not ManipFrame.Visible then return end
+    CountLabel.Text = string.format("Claimed: %d parts", #getClaimedParts())
+end)
+
+makeLabel(ManipFrame, "── Nudge All ──", 68)
+
+local nudgeDirs = {
+    { label = "▲ Up",      dir = Vector3.new(0,1,0)   },
+    { label = "▼ Down",    dir = Vector3.new(0,-1,0)  },
+    { label = "◀ Left",    dir = Vector3.new(-1,0,0)  },
+    { label = "▶ Right",   dir = Vector3.new(1,0,0)   },
+    { label = "▲ Forward", dir = Vector3.new(0,0,-1)  },
+    { label = "▼ Back",    dir = Vector3.new(0,0,1)   },
+}
+
+local nudgeY = 86
+for i, nd in ipairs(nudgeDirs) do
+    local col  = ((i - 1) % 2)
+    local row  = math.floor((i - 1) / 2)
+    local btnX = col == 0 and 0.05 or 0.52
+    local btn  = makeButton(ManipFrame, nd.label, nudgeY + row * 34, 0.43, btnX, Color3.fromRGB(30,100,160))
+    local dir  = nd.dir
+    btn.MouseButton1Click:Connect(function()
+        local cam   = Workspace.CurrentCamera
+        local camCF = cam and cam.CFrame or CFrame.new()
+        local mapped = dir
+        if dir == Vector3.new(-1,0,0) then
+            mapped = -Vector3.new(camCF.RightVector.X, 0, camCF.RightVector.Z).Unit
+        elseif dir == Vector3.new(1,0,0) then
+            mapped =  Vector3.new(camCF.RightVector.X, 0, camCF.RightVector.Z).Unit
+        elseif dir == Vector3.new(0,0,-1) then
+            mapped =  Vector3.new(camCF.LookVector.X, 0, camCF.LookVector.Z).Unit
+        elseif dir == Vector3.new(0,0,1) then
+            mapped = -Vector3.new(camCF.LookVector.X, 0, camCF.LookVector.Z).Unit
+        end
+        nudgeAll(mapped, NUDGE_AMT)
+        playSound("12221967")
+    end)
+end
+
+local nudgeY2 = nudgeY + 3 * 34 + 6
+makeStepper(ManipFrame, "Nudge Force", nudgeY2,
+    function() return NUDGE_AMT end,
+    function() NUDGE_AMT = math.min(10000, NUDGE_AMT + 50) end,
+    function() NUDGE_AMT = math.max(1,     NUDGE_AMT - 50) end
+)
+
+local flingY = nudgeY2 + 50
+makeLabel(ManipFrame, "── Fling ──", flingY)
+
+local FlingUpBtn  = makeButton(ManipFrame, "⬆  Fling Up",    flingY + 18, 0.43, 0.05, Color3.fromRGB(160,80,0))
+local FlingOutBtn = makeButton(ManipFrame, "💥  Explode Out", flingY + 18, 0.43, 0.52, Color3.fromRGB(160,30,0))
+
+FlingUpBtn.MouseButton1Click:Connect(function()
+    for _, p in ipairs(getClaimedParts()) do
+        if p and p.Parent then pcall(function() p.Velocity = Vector3.new(0, NUDGE_AMT * 10, 0) end) end
+    end
+    playSound("12221967")
+end)
+
+FlingOutBtn.MouseButton1Click:Connect(function()
+    local center = staticCenterPosition
+    for _, p in ipairs(getClaimedParts()) do
+        if p and p.Parent then
+            local dir = p.Position - center
+            if dir.Magnitude < 0.01 then
+                dir = Vector3.new(math.random()-0.5, math.random()-0.5, math.random()-0.5)
+            end
+            pcall(function() p.Velocity = dir.Unit * NUDGE_AMT * 10 end)
+        end
+    end
+    playSound("12221967")
+end)
+
+local vacuumY = flingY + 54
+makeLabel(ManipFrame, "── Vacuum ──", vacuumY)
+local VacuumBtn = makeButton(ManipFrame, "🌀  Vacuum To Center", vacuumY + 18, 0.9, 0.05, Color3.fromRGB(80,0,160))
+VacuumBtn.MouseButton1Click:Connect(function()
+    local center = staticCenterPosition
+    for _, p in ipairs(getClaimedParts()) do
+        if p and p.Parent then
+            local dir = center - p.Position
+            if dir.Magnitude > 0 then pcall(function() p.Velocity = dir.Unit * NUDGE_AMT * 10 end) end
+        end
+    end
+    playSound("12221967")
+end)
+
+local spinY = vacuumY + 54
+makeLabel(ManipFrame, "── Continuous ──", spinY)
+
+local SpinBtn   = makeButton(ManipFrame, "Spin: Off",   spinY + 18, 0.43, 0.05, Color3.fromRGB(100,0,200))
+local FreezeBtn = makeButton(ManipFrame, "Freeze: Off", spinY + 18, 0.43, 0.52, Color3.fromRGB(0,80,180))
+
+SpinBtn.MouseButton1Click:Connect(function()
+    MANIP_SPIN_ENABLED       = not MANIP_SPIN_ENABLED
+    SpinBtn.Text             = MANIP_SPIN_ENABLED and "Spin: On"  or "Spin: Off"
+    SpinBtn.BackgroundColor3 = MANIP_SPIN_ENABLED and Color3.fromRGB(50,205,50) or Color3.fromRGB(100,0,200)
+    playSound("12221967")
+end)
+FreezeBtn.MouseButton1Click:Connect(function()
+    MANIP_FREEZE_ENABLED       = not MANIP_FREEZE_ENABLED
+    FreezeBtn.Text             = MANIP_FREEZE_ENABLED and "Freeze: On"   or "Freeze: Off"
+    FreezeBtn.BackgroundColor3 = MANIP_FREEZE_ENABLED and Color3.fromRGB(50,180,255) or Color3.fromRGB(0,80,180)
+    playSound("12221967")
+end)
+
+makeStepper(ManipFrame, "Spin Speed", spinY + 54,
+    function() return MANIP_SPIN_SPEED end,
+    function() MANIP_SPIN_SPEED = math.min(10000, MANIP_SPIN_SPEED + 100) end,
+    function() MANIP_SPIN_SPEED = math.max(0,     MANIP_SPIN_SPEED - 100) end
+)
+
+local zeroY = spinY + 108
+local ZeroVelBtn = makeButton(ManipFrame, "⏹  Zero All Velocity", zeroY, 0.9, 0.05, Color3.fromRGB(40,40,40))
+ZeroVelBtn.MouseButton1Click:Connect(function()
+    for _, p in ipairs(getClaimedParts()) do
+        if p and p.Parent then
+            pcall(function() p.Velocity = Vector3.zero; p.RotVelocity = Vector3.zero end)
+        end
+    end
+    playSound("12221967")
+end)
+
+local Watermark2 = Instance.new("TextLabel")
+Watermark2.Size                   = UDim2.new(1, 0, 0, 16)
+Watermark2.Position               = UDim2.new(0, 0, 1, -18)
+Watermark2.Text                   = "Lil0darkie6 Sphere [Static Sync] by Zeus!"
+Watermark2.TextColor3             = Color3.fromRGB(200, 200, 200)
+Watermark2.BackgroundTransparency = 1
+Watermark2.Font                   = Enum.Font.Fondamento
+Watermark2.TextSize               = 11
+Watermark2.ZIndex                 = 11
+Watermark2.Parent                 = ManipFrame
+
+-- ═══════════════════════════════════════════════════════
+-- ─── TAB 1 BUTTON LOGIC ──────────────────────────────
+-- ═══════════════════════════════════════════════════════
+local sphereOn = false
+ToggleButton.MouseButton1Click:Connect(function()
+    sphereOn = not sphereOn; sphereEnabled = sphereOn
+    if sphereOn and LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart") then
+        staticCenterPosition = LocalPlayer.Character.HumanoidRootPart.Position
+        Part.Position        = staticCenterPosition
+    end
+    ToggleButton.Text             = sphereOn and "Sphere On" or "Sphere Off"
+    ToggleButton.BackgroundColor3 = sphereOn and Color3.fromRGB(50,205,50) or Color3.fromRGB(255,0,0)
+    playSound("12221967")
+end)
+
+LockPosButton.MouseButton1Click:Connect(function()
+    if LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart") then
+        staticCenterPosition = LocalPlayer.Character.HumanoidRootPart.Position
+        Part.Position        = staticCenterPosition; playSound("12221967")
+    end
+end)
+
+local stealOn = false
+StealButton.MouseButton1Click:Connect(function()
+    stealOn = not stealOn; STEAL_ENABLED = stealOn
+    StealButton.Text             = stealOn and "Steal: On" or "Steal: Off"
+    StealButton.BackgroundColor3 = stealOn and Color3.fromRGB(50,205,50) or Color3.fromRGB(180,0,0)
+    playSound("12221967")
+end)
+
+local ringOn = false
+RingButton.MouseButton1Click:Connect(function()
+    ringOn = not ringOn
+    if ringOn then
+        enableRing()
+        RingButton.Text             = "Pull Ring: On"
+        RingButton.BackgroundColor3 = Color3.fromRGB(50,205,50)
+    else
+        disableRing()
+        RingButton.Text             = "Pull Ring: Off"
+        RingButton.BackgroundColor3 = Color3.fromRGB(100,0,200)
+    end
+    playSound("12221967")
+end)
+
+local touchMoveOn = false
+TouchMoveButton.MouseButton1Click:Connect(function()
+    touchMoveOn          = not touchMoveOn
+    TOUCH_MOVE_ENABLED   = touchMoveOn
+    TouchOverlay.Visible = touchMoveOn
+    TouchMoveButton.Text             = touchMoveOn and "Touch Move: On" or "Touch Move: Off"
+    TouchMoveButton.BackgroundColor3 = touchMoveOn and Color3.fromRGB(50,205,50) or Color3.fromRGB(0,100,180)
+    if not touchMoveOn then activeTouches = {} end
+    playSound("12221967")
+end)
+
+-- ═══════════════════════════════════════════════════════
+-- ─── FLY SYSTEM ──────────────────────────────────────
+-- ═══════════════════════════════════════════════════════
+local flyEnabled  = false
+local flyBodyVel  = nil
+local flyBodyGyro = nil
+local leftWing    = nil
+local rightWing   = nil
+local wingConn    = nil
+
+local WING_COLOR = Color3.fromRGB(120, 60, 220)
+local WING_TRAIL = Color3.fromRGB(180, 120, 255)
+
+local function buildWing(isLeft)
+    local weld = Instance.new("Weld")
+    local wing = Instance.new("Part")
+    wing.Name         = isLeft and "LeftWing" or "RightWing"
+    wing.Size         = Vector3.new(0.2, 2.5, 4.5)
+    wing.Anchored     = false
+    wing.CanCollide   = false
+    wing.CastShadow   = false
+    wing.Material     = Enum.Material.Neon
+    wing.Color        = WING_COLOR
+    wing.Transparency = 0.15
+    wing.Parent       = character
+
+    local tip = Instance.new("Part")
+    tip.Name         = isLeft and "LeftWingTip" or "RightWingTip"
+    tip.Size         = Vector3.new(0.1, 1.0, 2.0)
+    tip.Anchored     = false
+    tip.CanCollide   = false
+    tip.CastShadow   = false
+    tip.Material     = Enum.Material.Neon
+    tip.Color        = WING_TRAIL
+    tip.Transparency = 0.25
+    tip.Parent       = character
+
+    local tipWeld  = Instance.new("Weld")
+    tipWeld.Part0  = wing; tipWeld.Part1 = tip
+    tipWeld.C0     = isLeft
+        and CFrame.new(0, -1.2, -2.2) * CFrame.Angles(0, 0, math.rad(-18))
+        or  CFrame.new(0, -1.2,  2.2) * CFrame.Angles(0, 0, math.rad(18))
+    tipWeld.Parent = wing
+
+    local a0 = Instance.new("Attachment", wing)
+    local a1 = Instance.new("Attachment", wing)
+    a0.Position = Vector3.new(0, 0, isLeft and -2 or  2)
+    a1.Position = Vector3.new(0, 0, isLeft and  2 or -2)
+
+    local trail = Instance.new("Trail")
+    trail.Attachment0  = a0; trail.Attachment1 = a1
+    trail.Color        = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, WING_TRAIL),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(60, 0, 120))
+    })
+    trail.Transparency = NumberSequence.new({
+        NumberSequenceKeypoint.new(0, 0.1),
+        NumberSequenceKeypoint.new(1, 1.0)
+    })
+    trail.Lifetime = 0.25; trail.MinLength = 0; trail.FaceCamera = true
+    trail.Parent   = wing
+
+    weld.Part0  = humanoidRootPart; weld.Part1 = wing
+    weld.C0     = CFrame.new((isLeft and -1 or 1) * 1.2, 0.5, 0.3)
+    weld.Parent = wing
+    return wing, weld
+end
+
+local function destroyWings()
+    if leftWing  and leftWing.Parent  then leftWing:Destroy()  end
+    if rightWing and rightWing.Parent then rightWing:Destroy() end
+    leftWing = nil; rightWing = nil
+    if wingConn then wingConn:Disconnect(); wingConn = nil end
+end
+
+local function spawnWings()
+    destroyWings()
+    leftWing  = buildWing(true)
+    rightWing = buildWing(false)
+    local flapT = 0; local flapSpeed = 3.5; local flapAmp = math.rad(42)
+    wingConn = RunService.Heartbeat:Connect(function(dt)
+        flapT = flapT + dt * flapSpeed
+        local sf        = 1 + (flySpeed / 200)
+        local flapAngle = math.sin(flapT * sf) * flapAmp
+        local tiltAngle = math.sin(flapT * sf + math.pi * 0.5) * math.rad(12)
+        local shimmer   = (math.sin(flapT * 2) + 1) / 2
+        local wc = Color3.new(0.47 + shimmer*0.20, 0.24 + shimmer*0.12, 0.86 - shimmer*0.15)
+        for _, wing in ipairs({ leftWing, rightWing }) do
+            if wing and wing.Parent then
+                local wi = wing:FindFirstChildWhichIsA("Weld")
+                if wi then
+                    local side = (wing.Name == "LeftWing") and -1 or 1
+                    wi.C0 = CFrame.new(side*1.2, 0.5, 0.3) * CFrame.Angles(tiltAngle, 0, side*flapAngle)
+                end
+                wing.Color = wc
+            end
+        end
+        for _, tipName in ipairs({ "LeftWingTip", "RightWingTip" }) do
+            local tip = character:FindFirstChild(tipName)
+            if tip then tip.Color = Color3.new(0.70 + shimmer*0.10, 0.47 + shimmer*0.08, 1.00) end
+        end
+    end)
+end
+
+local function enableFly()
+    flyEnabled = true
+    humanoid:SetStateEnabled(Enum.HumanoidStateType.Freefall, false)
+    humanoid:SetStateEnabled(Enum.HumanoidStateType.Jumping,  false)
+    humanoid:ChangeState(Enum.HumanoidStateType.Physics)
+    flyBodyVel            = Instance.new("BodyVelocity")
+    flyBodyVel.Velocity   = Vector3.new(0,0,0)
+    flyBodyVel.MaxForce   = Vector3.new(1e6,1e6,1e6)
+    flyBodyVel.P          = 1e4
+    flyBodyVel.Parent     = humanoidRootPart
+    flyBodyGyro           = Instance.new("BodyGyro")
+    flyBodyGyro.MaxTorque = Vector3.new(1e6,1e6,1e6)
+    flyBodyGyro.P         = 1e4
+    flyBodyGyro.D         = 500
+    flyBodyGyro.CFrame    = humanoidRootPart.CFrame
+    flyBodyGyro.Parent    = humanoidRootPart
+    spawnWings(); playSound("12221967")
+end
+
+local function disableFly()
+    flyEnabled = false
+    if flyBodyVel  then flyBodyVel:Destroy();  flyBodyVel  = nil end
+    if flyBodyGyro then flyBodyGyro:Destroy(); flyBodyGyro = nil end
+    humanoid:SetStateEnabled(Enum.HumanoidStateType.Freefall, true)
+    humanoid:SetStateEnabled(Enum.HumanoidStateType.Jumping,  true)
+    humanoid:ChangeState(Enum.HumanoidStateType.GravityScale)
+    destroyWings(); playSound("12221967")
+end
+
+RunService.Heartbeat:Connect(function(dt)
+    if not flyEnabled or not flyBodyVel or not flyBodyGyro then return end
+    local cam   = Workspace.CurrentCamera
+    local camCF = cam and cam.CFrame or CFrame.new()
+    local moveVec = Vector3.new(0,0,0)
+    if UserInputService:IsKeyDown(Enum.KeyCode.W) or UserInputService:IsKeyDown(Enum.KeyCode.Up)    then moveVec = moveVec + camCF.LookVector  end
+    if UserInputService:IsKeyDown(Enum.KeyCode.S) or UserInputService:IsKeyDown(Enum.KeyCode.Down)  then moveVec = moveVec - camCF.LookVector  end
+    if UserInputService:IsKeyDown(Enum.KeyCode.A) or UserInputService:IsKeyDown(Enum.KeyCode.Left)  then moveVec = moveVec - camCF.RightVector end
+    if UserInputService:IsKeyDown(Enum.KeyCode.D) or UserInputService:IsKeyDown(Enum.KeyCode.Right) then moveVec = moveVec + camCF.RightVector end
+    if UserInputService:IsKeyDown(Enum.KeyCode.E) then moveVec = moveVec + Vector3.new(0,1,0) end
+    if UserInputService:IsKeyDown(Enum.KeyCode.Q) then moveVec = moveVec - Vector3.new(0,1,0) end
+    if moveVec.Magnitude > 0 then
+        flyBodyVel.Velocity = moveVec.Unit * flySpeed
+    else
+        flyBodyVel.Velocity = Vector3.new(flyBodyVel.Velocity.X * 0.85, 0, flyBodyVel.Velocity.Z * 0.85)
+    end
+    local lookFlat = Vector3.new(camCF.LookVector.X, 0, camCF.LookVector.Z)
+    if lookFlat.Magnitude > 0.01 then
+        flyBodyGyro.CFrame = CFrame.lookAt(Vector3.new(0,0,0), lookFlat)
+    end
+end)
+
+FlyButton.MouseButton1Click:Connect(function()
+    if flyEnabled then
+        disableFly(); FlyButton.Text = "Fly: Off"; FlyButton.BackgroundColor3 = Color3.fromRGB(80,0,180)
+    else
+        enableFly();  FlyButton.Text = "Fly: On";  FlyButton.BackgroundColor3 = Color3.fromRGB(50,205,50)
+    end
+end)
+
+LocalPlayer.CharacterAdded:Connect(function(newChar)
+    character        = newChar
+    humanoidRootPart = newChar:WaitForChild("HumanoidRootPart")
+    humanoid         = newChar:WaitForChild("Humanoid")
+    if flyEnabled then task.wait(0.5); enableFly() end
+end)
+
+-- ─── Steal Engine ────────────────────────────────
+RunService.Heartbeat:Connect(function()
+    if not STEAL_ENABLED then return end
+    for _, part in ipairs(Workspace:GetDescendants()) do
+        if isEligiblePart(part) then
+            addPart(part)
+            local dir = staticCenterPosition - part.Position
+            if dir.Magnitude > 0 then part.Velocity = dir.Unit * STEAL_STRENGTH end
+        end
+    end
+end)
+
+-- ─── Init ────────────────────────────────────────
+local userId  = Players:GetUserIdFromNameAsync("Toolb0x3")
+local content = Players:GetUserThumbnailAsync(userId, Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size420x420)
+StarterGui:SetCore("SendNotification", {
+    Title    = "Lil0darkie6 Sphere Replicated",
+    Text     = "Modified",
+    Icon     = content,
+    Duration = 5
+})
+
+local function SendChatMessage(msg)
+    if TextChatService.ChatVersion == Enum.ChatVersion.TextChatService then
+        TextChatService.TextChannels.RBXGeneral:SendAsync(msg)
+    else
+        game:GetService("ReplicatedStorage").DefaultChatSystemChatEvents.SayMessageRequest:FireServer(msg, "All")
+    end
+end
+SendChatMessage(" hi ")
