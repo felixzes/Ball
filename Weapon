@@ -1,0 +1,1467 @@
+--[[
+    Lil0darkie6 Sphere v10 — WEAPON FORGE EDITION
+    all v9 features preserved + maximized force.
+    new: weapon formation system — sword / shield / spear / hammer
+    built from claimed unanchored parts, follows joystick drag position.
+    FE-replicated via Motor6D + AlignPosition. zero console output.
+]]
+
+local Players          = game:GetService("Players")
+local RunService       = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local SoundService     = game:GetService("SoundService")
+local StarterGui       = game:GetService("StarterGui")
+local TextChatService  = game:GetService("TextChatService")
+local Workspace        = game:GetService("Workspace")
+local LocalPlayer      = Players.LocalPlayer
+
+local character        = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+local humanoidRootPart = character:WaitForChild("HumanoidRootPart")
+local humanoid         = character:WaitForChild("Humanoid")
+
+-- ─── FORCE CONSTANTS ─────────────────────────────────────────────────────────
+local MAX_FORCE    = math.huge
+local MAX_VELOCITY = math.huge
+local MAX_RESPONSE = 2000
+local HAMMER_SPEED = 1e9
+
+-- ─── Folder + Anchor ─────────────────────────────────────────────────────────
+local Folder      = Instance.new("Folder", Workspace)
+local Part        = Instance.new("Part",   Folder)
+Part.Anchored     = true
+Part.CanCollide   = false
+Part.Transparency = 1
+local Attachment1 = Instance.new("Attachment", Part)
+
+local staticCenterPosition = humanoidRootPart.Position
+Part.Position = staticCenterPosition
+
+-- ─── Network ─────────────────────────────────────────────────────────────────
+if not getgenv().Network then
+    getgenv().Network = {
+        BaseParts = {},
+        Velocity  = Vector3.new(HAMMER_SPEED, HAMMER_SPEED, HAMMER_SPEED),
+    }
+end
+local Network = getgenv().Network
+Network.Velocity = Vector3.new(HAMMER_SPEED, HAMMER_SPEED, HAMMER_SPEED)
+
+Network.RetainPart = function(p)
+    if typeof(p) == "Instance" and p:IsA("BasePart") and p:IsDescendantOf(Workspace) then
+        if not table.find(Network.BaseParts, p) then
+            table.insert(Network.BaseParts, p)
+            p.CustomPhysicalProperties = PhysicalProperties.new(0,0,0,0,0)
+            p.CanCollide = false
+        end
+    end
+end
+
+LocalPlayer.ReplicationFocus = Workspace
+RunService.Heartbeat:Connect(function()
+    pcall(function()
+        sethiddenproperty(LocalPlayer, "SimulationRadius",    math.huge)
+        sethiddenproperty(LocalPlayer, "MaxSimulationRadius", math.huge)
+    end)
+    local center = staticCenterPosition
+    for _, p in pairs(Network.BaseParts) do
+        if p and p.Parent and p:IsDescendantOf(Workspace) then
+            pcall(function()
+                local dir  = center - p.Position
+                local dist = dir.Magnitude
+                if dist > 0.01 then
+                    p.Velocity = (dir / dist) * HAMMER_SPEED
+                else
+                    p.Velocity = Vector3.zero
+                end
+            end)
+        end
+    end
+end)
+
+-- ─── Sound ───────────────────────────────────────────────────────────────────
+local function playSound(id)
+    local s = Instance.new("Sound")
+    s.SoundId = "rbxassetid://" .. id
+    s.Parent  = SoundService
+    s:Play()
+    s.Ended:Connect(function() s:Destroy() end)
+end
+playSound("2865227271")
+
+-- ─── Shape State ─────────────────────────────────────────────────────────────
+local SHAPES      = { "Sphere", "Ring", "Grid", "Helix" }
+local shapeIndex  = 1
+local radius      = 50
+local rotSpeed    = 0.5
+local gridSpacing = 8
+local helixTurns  = 3
+local helixHeight = 60
+
+local function getTargetPosition(i, count, t, center)
+    local shape = SHAPES[shapeIndex]
+    if shape == "Sphere" then
+        local phi   = math.acos(1 - 2 * i / math.max(count, 1))
+        local theta = (math.pi * (1 + math.sqrt(5)) * i) + t
+        return Vector3.new(
+            center.X + radius * math.sin(phi) * math.cos(theta),
+            center.Y + radius * math.cos(phi),
+            center.Z + radius * math.sin(phi) * math.sin(theta)
+        )
+    elseif shape == "Ring" then
+        local angle = (2 * math.pi * i / math.max(count, 1)) + t
+        return Vector3.new(center.X + radius * math.cos(angle), center.Y, center.Z + radius * math.sin(angle))
+    elseif shape == "Grid" then
+        local n    = math.ceil(count ^ (1/3))
+        local nx   = (i-1) % n
+        local ny   = math.floor((i-1)/n) % n
+        local nz   = math.floor((i-1)/(n*n)) % n
+        local half = (n-1)/2
+        return Vector3.new(
+            center.X + (nx-half)*gridSpacing,
+            center.Y + (ny-half)*gridSpacing,
+            center.Z + (nz-half)*gridSpacing
+        )
+    elseif shape == "Helix" then
+        local frac  = i / math.max(count, 1)
+        local angle = frac * helixTurns * 2 * math.pi + t
+        return Vector3.new(
+            center.X + radius * math.cos(angle),
+            center.Y - helixHeight/2 + frac * helixHeight,
+            center.Z + radius * math.sin(angle)
+        )
+    end
+    return center
+end
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- ─── WEAPON FORMATION SYSTEM ─────────────────────────────────────────────────
+-- each weapon is defined as a list of offsets relative to a weapon origin.
+-- the weapon origin follows the joystick drag position in 3D space.
+-- parts are assigned to weapon slots and their AlignPosition target updates
+-- every heartbeat to the slot's world position.
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+local WEAPONS = {
+    -- ── SWORD ──────────────────────────────────────────────────────────────
+    -- blade: long column of parts along +Z (forward)
+    -- guard: horizontal row at base
+    -- handle: 2 parts below guard
+    Sword = function(count)
+        local offsets = {}
+        local BLADE_LEN = 14   -- parts in blade column
+        local spacing   = 2.0
+
+        -- blade (front to tip)
+        for i = 1, math.min(BLADE_LEN, count) do
+            table.insert(offsets, Vector3.new(0, 0, i * spacing))
+        end
+        -- guard (left + right of base)
+        local guardSlots = { Vector3.new(-3, 0, 1.5), Vector3.new(-1.5, 0, 1.5),
+                             Vector3.new(1.5, 0, 1.5), Vector3.new(3, 0, 1.5) }
+        for _, g in ipairs(guardSlots) do
+            if #offsets < count then table.insert(offsets, g) end
+        end
+        -- handle (behind guard)
+        for i = 1, 3 do
+            if #offsets < count then
+                table.insert(offsets, Vector3.new(0, 0, -i * spacing * 0.8))
+            end
+        end
+        -- pommel
+        if #offsets < count then
+            table.insert(offsets, Vector3.new(0, 0, -3 * spacing * 0.8 - 1.5))
+        end
+        -- fill remaining with a cloud cluster around handle
+        local fi = 0
+        while #offsets < count do
+            fi = fi + 1
+            table.insert(offsets, Vector3.new(
+                math.sin(fi * 1.3) * 2,
+                math.cos(fi * 0.9) * 1.5,
+                -fi * 0.4
+            ))
+        end
+        return offsets
+    end,
+
+    -- ── SHIELD ─────────────────────────────────────────────────────────────
+    -- circular disc of parts facing the camera (XY plane)
+    Shield = function(count)
+        local offsets = {}
+        local RINGS   = { {r=0, n=1}, {r=3,n=8}, {r=6,n=16}, {r=9,n=24}, {r=12,n=32} }
+        for _, ring in ipairs(RINGS) do
+            local step = ring.n > 0 and (2 * math.pi / ring.n) or 0
+            for j = 0, ring.n - 1 do
+                if #offsets < count then
+                    local a = j * step
+                    table.insert(offsets, Vector3.new(
+                        ring.r * math.cos(a),
+                        ring.r * math.sin(a),
+                        0
+                    ))
+                end
+            end
+        end
+        -- boss (center protrusion)
+        if #offsets < count then table.insert(offsets, Vector3.new(0, 0, -2)) end
+        -- fill
+        local fi = 0
+        while #offsets < count do
+            fi = fi + 1
+            table.insert(offsets, Vector3.new(math.sin(fi)*13, math.cos(fi)*13, 0))
+        end
+        return offsets
+    end,
+
+    -- ── SPEAR ──────────────────────────────────────────────────────────────
+    -- long shaft + arrowhead tip
+    Spear = function(count)
+        local offsets = {}
+        local SHAFT   = 20
+        local sp      = 2.2
+
+        -- shaft
+        for i = 1, math.min(SHAFT, count) do
+            table.insert(offsets, Vector3.new(0, 0, i * sp))
+        end
+        -- arrowhead (diamond tip, 5 parts)
+        local tipBase = SHAFT * sp
+        local tipPts  = {
+            Vector3.new(0,   0,   tipBase + sp*1.5),
+            Vector3.new(1.5, 0,   tipBase + sp*0.5),
+            Vector3.new(-1.5,0,   tipBase + sp*0.5),
+            Vector3.new(0,   1.5, tipBase + sp*0.5),
+            Vector3.new(0,  -1.5, tipBase + sp*0.5),
+        }
+        for _, v in ipairs(tipPts) do
+            if #offsets < count then table.insert(offsets, v) end
+        end
+        -- butt cap
+        if #offsets < count then table.insert(offsets, Vector3.new(0, 0, -sp)) end
+        -- fill
+        local fi = 0
+        while #offsets < count do
+            fi = fi + 1
+            table.insert(offsets, Vector3.new(math.sin(fi)*1.5, math.cos(fi)*1.5, fi * -0.5))
+        end
+        return offsets
+    end,
+
+    -- ── HAMMER ─────────────────────────────────────────────────────────────
+    -- thick handle + wide rectangular hammerhead
+    Hammer = function(count)
+        local offsets = {}
+        -- handle
+        for i = 1, 8 do
+            if #offsets < count then
+                table.insert(offsets, Vector3.new(0, 0, -i * 2))
+            end
+        end
+        -- hammerhead: 3x3x2 block at top
+        for x = -2, 2, 2 do
+            for y = -2, 2, 2 do
+                for z = 0, 2, 2 do
+                    if #offsets < count then
+                        table.insert(offsets, Vector3.new(x * 2, y * 2, z * 1.5))
+                    end
+                end
+            end
+        end
+        -- fill
+        local fi = 0
+        while #offsets < count do
+            fi = fi + 1
+            table.insert(offsets, Vector3.new(
+                math.sin(fi * 0.7) * 5,
+                math.cos(fi * 0.7) * 5,
+                0
+            ))
+        end
+        return offsets
+    end,
+}
+
+-- weapon state
+local WEAPON_NAMES  = { "None", "Sword", "Shield", "Spear", "Hammer" }
+local weaponIndex   = 1  -- 1 = None
+local weaponEnabled = false
+local weaponAnchors = {}  -- list of anchor parts per slot
+local weaponAttachments = {}  -- corresponding Attachment for each anchor
+
+-- weapon origin tracking — follows the joystick 3D world position
+-- offset: 8 studs in front of and slightly above the sphere center
+local weaponOriginOffset = Vector3.new(0, 4, 8)
+
+-- rotation accumulator for weapon spin (optional slow spin around Y)
+local weaponRotT = 0
+
+-- ── build/destroy weapon anchor nodes ────────────────────────────────────────
+
+local function destroyWeaponAnchors()
+    for _, a in ipairs(weaponAnchors) do
+        if a and a.Parent then a:Destroy() end
+    end
+    weaponAnchors      = {}
+    weaponAttachments  = {}
+end
+
+local function buildWeaponAnchors(count)
+    destroyWeaponAnchors()
+    for i = 1, count do
+        local a           = Instance.new("Part", Folder)
+        a.Anchored        = true
+        a.CanCollide      = false
+        a.Transparency    = 1
+        a.Size            = Vector3.new(1,1,1)
+        a.Position        = staticCenterPosition
+        local att         = Instance.new("Attachment", a)
+        weaponAnchors[i]     = a
+        weaponAttachments[i] = att
+    end
+end
+
+-- ── attach parts to weapon anchor nodes ──────────────────────────────────────
+
+local function attachPartToWeaponSlot(part, slotIndex)
+    -- clear existing movers
+    for _, x in ipairs(part:GetChildren()) do
+        if x:IsA("BodyAngularVelocity") or x:IsA("BodyForce") or x:IsA("BodyGyro")
+        or x:IsA("BodyPosition") or x:IsA("BodyThrust") or x:IsA("BodyVelocity")
+        or x:IsA("RocketPropulsion") then x:Destroy() end
+    end
+    for _, n in ipairs({"Attachment","AlignPosition","Torque","WeaponAtt","WeaponAP","WeaponTorque"}) do
+        local c = part:FindFirstChild(n); if c then c:Destroy() end
+    end
+
+    part.CanCollide = false
+    part.CustomPhysicalProperties = PhysicalProperties.new(0,0,0,0,0)
+
+    local pAtt     = Instance.new("Attachment", part); pAtt.Name = "WeaponAtt"
+    local torque   = Instance.new("Torque",     part); torque.Name = "WeaponTorque"
+    torque.Torque  = Vector3.new(1e9,1e9,1e9); torque.Attachment0 = pAtt
+
+    local ap           = Instance.new("AlignPosition", part); ap.Name = "WeaponAP"
+    ap.MaxForce        = MAX_FORCE
+    ap.MaxVelocity     = MAX_VELOCITY
+    ap.Responsiveness  = MAX_RESPONSE
+    ap.Attachment0     = pAtt
+    ap.Attachment1     = weaponAttachments[slotIndex]
+    ap.Parent          = part
+end
+
+-- ── enable / disable weapon ───────────────────────────────────────────────────
+
+local weaponParts = {}  -- parts currently assigned to weapon slots
+
+local function disableWeapon()
+    weaponEnabled = false
+    -- strip weapon constraints from all weapon parts
+    for _, p in ipairs(weaponParts) do
+        if p and p.Parent then
+            for _, n in ipairs({"WeaponAtt","WeaponAP","WeaponTorque"}) do
+                local c = p:FindFirstChild(n); if c then c:Destroy() end
+            end
+        end
+    end
+    weaponParts = {}
+    destroyWeaponAnchors()
+end
+
+local function enableWeapon(name)
+    disableWeapon()
+    if name == "None" then return end
+
+    -- collect eligible parts from the claimed pool
+    local pool = {}
+    for _, p in ipairs(Network.BaseParts) do
+        if p and p.Parent and p:IsDescendantOf(Workspace)
+        and not p:IsDescendantOf(Folder) then
+            table.insert(pool, p)
+        end
+    end
+
+    -- also pull from the main parts list
+    for _, p in ipairs(parts) do
+        if p and p.Parent and not table.find(pool, p) then
+            table.insert(pool, p)
+        end
+    end
+
+    if #pool == 0 then return end
+
+    -- generate offsets for this weapon shape
+    local builder  = WEAPONS[name]
+    if not builder then return end
+    local offsets  = builder(#pool)
+    local useCount = math.min(#pool, #offsets)
+
+    buildWeaponAnchors(useCount)
+
+    for i = 1, useCount do
+        local p = pool[i]
+        Network.RetainPart(p)
+        attachPartToWeaponSlot(p, i)
+        table.insert(weaponParts, p)
+    end
+
+    weaponEnabled = true
+    playSound("12221967")
+end
+
+-- ── weapon origin from joystick / sphere position ─────────────────────────────
+-- the weapon floats 8 studs in front of the sphere center
+-- "front" = camera look direction projected to XZ, so it faces the player's view
+
+local function getWeaponOriginCFrame()
+    local cam     = Workspace.CurrentCamera
+    local camCF   = cam and cam.CFrame or CFrame.new()
+    local forward = Vector3.new(camCF.LookVector.X, 0, camCF.LookVector.Z)
+    if forward.Magnitude < 0.01 then forward = Vector3.new(0, 0, 1) end
+    forward = forward.Unit
+
+    local origin  = staticCenterPosition
+        + forward * weaponOriginOffset.Z
+        + Vector3.new(0, weaponOriginOffset.Y, 0)
+
+    -- weapon faces the forward direction (so sword blade points forward)
+    local cf = CFrame.lookAt(origin, origin + forward)
+    return cf
+end
+
+-- ── weapon heartbeat: update anchor positions each frame ─────────────────────
+RunService.Heartbeat:Connect(function(dt)
+    if not weaponEnabled or #weaponAnchors == 0 then return end
+
+    weaponRotT = weaponRotT + dt * 0.4  -- slow drift rotation
+
+    local weaponCF    = getWeaponOriginCFrame()
+    local weaponName  = WEAPON_NAMES[weaponIndex]
+    local builder     = weaponName ~= "None" and WEAPONS[weaponName]
+    local offsets     = builder and builder(#weaponAnchors) or {}
+
+    for i, anchor in ipairs(weaponAnchors) do
+        if anchor and anchor.Parent then
+            local offset = offsets[i] or Vector3.new(0,0,0)
+            -- transform offset from weapon-local space to world space
+            local worldPos = weaponCF:PointToWorldSpace(offset)
+            anchor.Position = worldPos
+
+            -- also velocity-hammer the weapon part toward its slot
+            local wp = weaponParts[i]
+            if wp and wp.Parent then
+                pcall(function()
+                    local dir  = worldPos - wp.Position
+                    local dist = dir.Magnitude
+                    if dist > 0.01 then
+                        wp.Velocity = (dir / dist) * HAMMER_SPEED
+                    end
+                end)
+            end
+        end
+    end
+end)
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- ─── WALK ANIMATION — Motor6D direct drive ───────────────────────────────────
+-- ═══════════════════════════════════════════════════════════════════════════════
+local animConn = nil
+local walkT    = 0
+
+local ANIM = {
+    CYCLE_SPEED      = 7.5,
+    HEAD_PITCH       = math.rad(8),
+    HEAD_BOB_AMP     = math.rad(2),
+    HEAD_SWAY_AMP    = math.rad(1.2),
+    NECK_PITCH       = math.rad(6),
+    HIP_SWAY_AMP     = math.rad(4),
+    TORSO_TWIST_AMP  = math.rad(3),
+    TORSO_BOB_AMP    = math.rad(1.5),
+    WAIST_PITCH      = math.rad(2),
+    ARM_PITCH        = math.rad(92),
+    ARM_ROLL_L       = math.rad(-38),
+    ARM_ROLL_R       = math.rad(38),
+    ARM_CROSS_YAW    = math.rad(18),
+    ARM_IDLE_FLOAT   = math.rad(1.5),
+    LEG_SWING_AMP    = math.rad(30),
+    KNEE_BEND_AMP    = math.rad(22),
+    ANKLE_STRIKE_AMP = math.rad(14),
+}
+
+local function detectRig(char)
+    if char:FindFirstChild("UpperTorso") then return "R15" end
+    if char:FindFirstChild("Torso")      then return "R6"  end
+    return nil
+end
+
+local function getMotors(char)
+    local rig = detectRig(char)
+    if rig == "R15" then
+        local UT = char:FindFirstChild("UpperTorso")
+        local LT = char:FindFirstChild("LowerTorso")
+        local H  = char:FindFirstChild("Head")
+        if not (UT and LT) then return nil, nil end
+        return rig, {
+            waist     = UT:FindFirstChild("Waist"),
+            neck      = H and H:FindFirstChild("Neck") or UT:FindFirstChild("Neck"),
+            lShoulder = UT:FindFirstChild("LeftShoulder"),
+            rShoulder = UT:FindFirstChild("RightShoulder"),
+            lElbow    = char:FindFirstChild("LeftLowerArm")  and char:FindFirstChild("LeftLowerArm"):FindFirstChild("LeftElbow"),
+            rElbow    = char:FindFirstChild("RightLowerArm") and char:FindFirstChild("RightLowerArm"):FindFirstChild("RightElbow"),
+            lHip      = LT:FindFirstChild("LeftHip"),
+            rHip      = LT:FindFirstChild("RightHip"),
+            lKnee     = char:FindFirstChild("LeftLowerLeg")  and char:FindFirstChild("LeftLowerLeg"):FindFirstChild("LeftKnee"),
+            rKnee     = char:FindFirstChild("RightLowerLeg") and char:FindFirstChild("RightLowerLeg"):FindFirstChild("RightKnee"),
+            lAnkle    = char:FindFirstChild("LeftFoot")  and char:FindFirstChild("LeftFoot"):FindFirstChild("LeftAnkle"),
+            rAnkle    = char:FindFirstChild("RightFoot") and char:FindFirstChild("RightFoot"):FindFirstChild("RightAnkle"),
+        }
+    elseif rig == "R6" then
+        local T = char:FindFirstChild("Torso")
+        if not T then return nil, nil end
+        return rig, {
+            neck      = T:FindFirstChild("Neck"),
+            lShoulder = T:FindFirstChild("Left Shoulder"),
+            rShoulder = T:FindFirstChild("Right Shoulder"),
+            lHip      = T:FindFirstChild("Left Hip"),
+            rHip      = T:FindFirstChild("Right Hip"),
+        }
+    end
+    return nil, nil
+end
+
+local defaultC0 = {}
+local function cacheDefaults(motors)
+    for k, m in pairs(motors) do
+        if m and m:IsA("Motor6D") then defaultC0[k] = m.C0 end
+    end
+end
+local function safeSet(motor, cf)
+    if motor and motor.Parent and motor:IsA("Motor6D") then motor.C0 = cf end
+end
+
+local function startWalkAnim(char, hum)
+    if animConn then animConn:Disconnect(); animConn = nil end
+    defaultC0 = {}
+    local rig, motors = getMotors(char)
+    if not rig or not motors then return end
+    cacheDefaults(motors)
+
+    animConn = RunService.Heartbeat:Connect(function(dt)
+        walkT = walkT + dt
+        local r2, m = getMotors(char)
+        if not r2 or not m then return end
+        local moving  = hum.MoveDirection.Magnitude > 0.1
+        local legAmp  = moving and ANIM.LEG_SWING_AMP    or 0
+        local kneeAmp = moving and ANIM.KNEE_BEND_AMP    or 0
+        local ankAmp  = moving and ANIM.ANKLE_STRIKE_AMP or 0
+        local c  = walkT * ANIM.CYCLE_SPEED
+        local s  = math.sin(c); local s2 = math.sin(c*2); local c1 = math.cos(c)
+        local lThigh  =  s * legAmp;  local rThigh = -s * legAmp
+        local lKnee   = math.max(0,  c1) * kneeAmp
+        local rKnee   = math.max(0, -c1) * kneeAmp
+        local lAnkle  = -math.sin(c-0.4) * ankAmp
+        local rAnkle  =  math.sin(c-0.4) * ankAmp
+        local hipSway    = -s  * ANIM.HIP_SWAY_AMP
+        local torsoTwist =  s  * ANIM.TORSO_TWIST_AMP
+        local bob        = s2 * ANIM.TORSO_BOB_AMP
+        local breathe    = math.sin(walkT*1.8) * ANIM.ARM_IDLE_FLOAT
+        if r2 == "R15" then
+            safeSet(m.waist,    (defaultC0["waist"]    or CFrame.new()) * CFrame.Angles(ANIM.WAIST_PITCH+bob, torsoTwist, hipSway))
+            safeSet(m.neck,     (defaultC0["neck"]     or CFrame.new()) * CFrame.Angles(ANIM.NECK_PITCH+s*ANIM.HEAD_BOB_AMP, s*ANIM.HEAD_SWAY_AMP, 0))
+            safeSet(m.lShoulder,(defaultC0["lShoulder"] or CFrame.new(-0.5,0,0)) * CFrame.Angles(ANIM.ARM_PITCH,-ANIM.ARM_CROSS_YAW,ANIM.ARM_ROLL_L+breathe))
+            safeSet(m.rShoulder,(defaultC0["rShoulder"] or CFrame.new(0.5,0,0))  * CFrame.Angles(ANIM.ARM_PITCH, ANIM.ARM_CROSS_YAW,ANIM.ARM_ROLL_R-breathe))
+            if m.lElbow then safeSet(m.lElbow,(defaultC0["lElbow"] or CFrame.new())*CFrame.Angles(0,0,math.rad(-55))) end
+            if m.rElbow then safeSet(m.rElbow,(defaultC0["rElbow"] or CFrame.new())*CFrame.Angles(0,0,math.rad(55)))  end
+            safeSet(m.lHip, (defaultC0["lHip"] or CFrame.new())*CFrame.Angles(lThigh,0,hipSway*0.5))
+            safeSet(m.rHip, (defaultC0["rHip"] or CFrame.new())*CFrame.Angles(rThigh,0,hipSway*0.5))
+            if m.lKnee  then safeSet(m.lKnee,  (defaultC0["lKnee"]  or CFrame.new())*CFrame.Angles(-lKnee,  0,0)) end
+            if m.rKnee  then safeSet(m.rKnee,  (defaultC0["rKnee"]  or CFrame.new())*CFrame.Angles(-rKnee,  0,0)) end
+            if m.lAnkle then safeSet(m.lAnkle, (defaultC0["lAnkle"] or CFrame.new())*CFrame.Angles(lAnkle,  0,0)) end
+            if m.rAnkle then safeSet(m.rAnkle, (defaultC0["rAnkle"] or CFrame.new())*CFrame.Angles(rAnkle,  0,0)) end
+        elseif r2 == "R6" then
+            safeSet(m.neck,      CFrame.new(0,1,0)*CFrame.Angles(-math.pi/2+ANIM.HEAD_PITCH+s*ANIM.HEAD_BOB_AMP,s*ANIM.HEAD_SWAY_AMP,math.pi))
+            safeSet(m.lShoulder, CFrame.new(-1,0.5,0)*CFrame.Angles(ANIM.ARM_PITCH,-ANIM.ARM_CROSS_YAW,-math.pi/2+ANIM.ARM_ROLL_L+breathe))
+            safeSet(m.rShoulder, CFrame.new(1, 0.5,0)*CFrame.Angles(ANIM.ARM_PITCH, ANIM.ARM_CROSS_YAW, math.pi/2+ANIM.ARM_ROLL_R-breathe))
+            safeSet(m.lHip, CFrame.new(-1,-1,0)*CFrame.Angles(lThigh,0,-math.pi/2))
+            safeSet(m.rHip, CFrame.new(1, -1,0)*CFrame.Angles(rThigh,0, math.pi/2))
+        end
+    end)
+end
+
+startWalkAnim(character, humanoid)
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- ─── OUTER PULL RING ─────────────────────────────────────────────────────────
+-- ═══════════════════════════════════════════════════════════════════════════════
+local RING_COUNT  = 12; local RING_OFFSET = 10
+local ringEnabled = false; local ringAngle = 0
+local ringNodes   = {}; local ringPool = {}; local ringParts = {}
+local parts       = {}; local partAngles = {}
+
+local function removePartFromRing(part)
+    local idx = table.find(ringParts, part)
+    if idx then table.remove(ringParts, idx); ringPool[part] = nil end
+end
+
+local function buildRingNodes()
+    for i = 1, RING_COUNT do
+        local a=Instance.new("Part",Folder); a.Anchored=true; a.CanCollide=false
+        a.Transparency=1; a.Size=Vector3.new(1,1,1); a.Position=staticCenterPosition
+        local att=Instance.new("Attachment",a); ringNodes[i]={anchor=a,att=att}
+    end
+end
+
+local function destroyRingNodes()
+    for _,n in ipairs(ringNodes) do if n.anchor and n.anchor.Parent then n.anchor:Destroy() end end
+    ringNodes={}; ringPool={}; ringParts={}
+end
+
+local function updateRingNodes(center, r)
+    local rr = r + RING_OFFSET
+    for i, n in ipairs(ringNodes) do
+        local angle = ringAngle + (2*math.pi*(i-1)/RING_COUNT)
+        n.anchor.Position = Vector3.new(center.X+rr*math.cos(angle), center.Y, center.Z+rr*math.sin(angle))
+    end
+end
+
+local function forcePartToRingNode(part, ni)
+    local node = ringNodes[ni]; if not node then return end
+    for _,x in next,part:GetChildren() do
+        if x:IsA("BodyAngularVelocity") or x:IsA("BodyForce") or x:IsA("BodyGyro")
+        or x:IsA("BodyPosition") or x:IsA("BodyThrust") or x:IsA("BodyVelocity")
+        or x:IsA("RocketPropulsion") then x:Destroy() end
+    end
+    for _,n in ipairs({"RingAttachment","RingAlignPosition","RingTorque"}) do
+        local c=part:FindFirstChild(n); if c then c:Destroy() end
+    end
+    part.CanCollide=false
+    local pAtt=Instance.new("Attachment",part); pAtt.Name="RingAttachment"
+    local torque=Instance.new("Torque",part); torque.Name="RingTorque"
+    torque.Torque=Vector3.new(1e9,1e9,1e9); torque.Attachment0=pAtt
+    local ap=Instance.new("AlignPosition",part); ap.Name="RingAlignPosition"
+    ap.MaxForce=MAX_FORCE; ap.MaxVelocity=MAX_VELOCITY; ap.Responsiveness=MAX_RESPONSE
+    ap.Attachment0=pAtt; ap.Attachment1=node.att; ap.Parent=part
+end
+
+local function isEligibleForRing(part)
+    if not part:IsA("BasePart") then return false end
+    if part.Anchored then return false end
+    if not part:IsDescendantOf(Workspace) then return false end
+    if part:IsDescendantOf(Folder) then return false end
+    if LocalPlayer.Character and part:IsDescendantOf(LocalPlayer.Character) then return false end
+    local a=part.Parent
+    while a and a~=Workspace do
+        if a:FindFirstChild("Humanoid") or a:FindFirstChild("Head") then return false end
+        a=a.Parent
+    end
+    return true
+end
+
+local function addPartToRing(part)
+    if not ringEnabled then return end
+    if not isEligibleForRing(part) then return end
+    if table.find(parts,part) or table.find(ringParts,part) then return end
+    Network.RetainPart(part)
+    table.insert(ringParts,part)
+    local ni=((#ringParts-1)%RING_COUNT)+1
+    ringPool[part]=ni; forcePartToRingNode(part,ni)
+end
+
+local function enableRing()
+    ringEnabled=true; buildRingNodes()
+    updateRingNodes(staticCenterPosition,radius)
+    for _,o in ipairs(Workspace:GetDescendants()) do addPartToRing(o) end
+end
+
+local function disableRing()
+    ringEnabled=false
+    for _,p in ipairs(ringParts) do
+        if p and p.Parent then
+            for _,n in ipairs({"RingAttachment","RingAlignPosition","RingTorque"}) do
+                local c=p:FindFirstChild(n); if c then c:Destroy() end
+            end
+        end
+    end
+    destroyRingNodes()
+end
+
+RunService.Heartbeat:Connect(function(dt)
+    if not ringEnabled then return end
+    ringAngle=ringAngle+dt*rotSpeed
+    updateRingNodes(staticCenterPosition,radius)
+    for _,o in ipairs(Workspace:GetDescendants()) do addPartToRing(o) end
+end)
+Workspace.DescendantAdded:Connect(function(o) if ringEnabled then addPartToRing(o) end end)
+Workspace.DescendantRemoving:Connect(removePartFromRing)
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- ─── TOUCH TO MOVE ───────────────────────────────────────────────────────────
+-- ═══════════════════════════════════════════════════════════════════════════════
+local TOUCH_MOVE_ENABLED=false; local TOUCH_EXCLUSION_R=14; local activeTouches={}
+
+local function screenToWorld(sp)
+    local cam=Workspace.CurrentCamera; if not cam then return nil end
+    local ray=cam:ScreenPointToRay(sp.X,sp.Y)
+    local planeY=humanoidRootPart and humanoidRootPart.Position.Y or staticCenterPosition.Y
+    local o,d=ray.Origin,ray.Direction
+    if math.abs(d.Y)<0.0001 then return o+d*100 end
+    local t=(planeY-o.Y)/d.Y; if t<0 then return o+d*100 end
+    return o+d*t
+end
+
+local function applyTouchMove(sp)
+    local wp=screenToWorld(sp); if not wp then return end
+    local desired=Vector3.new(wp.X,staticCenterPosition.Y,wp.Z)
+    if humanoidRootPart then
+        local pf=Vector3.new(humanoidRootPart.Position.X,staticCenterPosition.Y,humanoidRootPart.Position.Z)
+        local diff=desired-pf; local dist=diff.Magnitude
+        if dist<TOUCH_EXCLUSION_R then
+            desired=dist<0.01 and pf+Vector3.new(TOUCH_EXCLUSION_R,0,0) or pf+diff.Unit*TOUCH_EXCLUSION_R
+        end
+    end
+    staticCenterPosition=desired; Part.Position=staticCenterPosition
+end
+
+local TouchOverlay=Instance.new("Frame")
+TouchOverlay.Size=UDim2.new(1,0,1,0); TouchOverlay.BackgroundTransparency=1
+TouchOverlay.BorderSizePixel=0; TouchOverlay.ZIndex=1; TouchOverlay.Visible=false
+
+local function connectTouchOverlay(sg)
+    TouchOverlay.Parent=sg
+    TouchOverlay.InputBegan:Connect(function(i)
+        if not TOUCH_MOVE_ENABLED then return end
+        if i.UserInputType~=Enum.UserInputType.Touch and i.UserInputType~=Enum.UserInputType.MouseButton1 then return end
+        activeTouches[i]=true; applyTouchMove(Vector2.new(i.Position.X,i.Position.Y))
+    end)
+    TouchOverlay.InputChanged:Connect(function(i)
+        if not TOUCH_MOVE_ENABLED or not activeTouches[i] then return end
+        if i.UserInputType~=Enum.UserInputType.Touch and i.UserInputType~=Enum.UserInputType.MouseMovement then return end
+        applyTouchMove(Vector2.new(i.Position.X,i.Position.Y))
+    end)
+    TouchOverlay.InputEnded:Connect(function(i) activeTouches[i]=nil end)
+end
+
+RunService.Heartbeat:Connect(function()
+    if not TOUCH_MOVE_ENABLED or not humanoidRootPart then return end
+    local pf=Vector3.new(humanoidRootPart.Position.X,staticCenterPosition.Y,humanoidRootPart.Position.Z)
+    local diff=staticCenterPosition-pf; local dist=diff.Magnitude
+    if dist<TOUCH_EXCLUSION_R then
+        staticCenterPosition=dist<0.01 and pf+Vector3.new(TOUCH_EXCLUSION_R,0,0) or pf+diff.Unit*TOUCH_EXCLUSION_R
+        Part.Position=staticCenterPosition
+    end
+end)
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- ─── MANIPULATION STATE ──────────────────────────────────────────────────────
+-- ═══════════════════════════════════════════════════════════════════════════════
+local MANIP_SPIN_ENABLED=false; local MANIP_FREEZE_ENABLED=false
+local MANIP_SPIN_SPEED=200; local NUDGE_AMT=50
+
+local function getClaimedParts()
+    local live={}
+    for _,p in ipairs(Network.BaseParts) do
+        if p and p.Parent and p:IsDescendantOf(Workspace) then table.insert(live,p) end
+    end
+    return live
+end
+
+local function nudgeAll(dir,amount)
+    for _,p in ipairs(getClaimedParts()) do
+        if p and p.Parent then pcall(function() p.Velocity=p.Velocity+dir*amount end) end
+    end
+end
+
+RunService.Heartbeat:Connect(function()
+    if not MANIP_FREEZE_ENABLED then return end
+    for _,p in ipairs(getClaimedParts()) do
+        if p and p.Parent then pcall(function() p.Velocity=Vector3.zero; p.RotVelocity=Vector3.zero end) end
+    end
+end)
+RunService.Heartbeat:Connect(function()
+    if not MANIP_SPIN_ENABLED then return end
+    for _,p in ipairs(getClaimedParts()) do
+        if p and p.Parent then pcall(function() p.RotVelocity=Vector3.new(MANIP_SPIN_SPEED,MANIP_SPIN_SPEED,MANIP_SPIN_SPEED) end) end
+    end
+end)
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- ─── GUI ─────────────────────────────────────────────────────────────────────
+-- ═══════════════════════════════════════════════════════════════════════════════
+local ScreenGui=Instance.new("ScreenGui")
+ScreenGui.Name="Lil0darkie6v10"; ScreenGui.ResetOnSpawn=false
+ScreenGui.Parent=LocalPlayer:WaitForChild("PlayerGui")
+connectTouchOverlay(ScreenGui)
+
+local PANEL_W,PANEL_H=260,620
+
+local PanelContainer=Instance.new("Frame")
+PanelContainer.Size=UDim2.new(0,PANEL_W,0,PANEL_H+36)
+PanelContainer.Position=UDim2.new(0.5,-(PANEL_W/2),0.5,-((PANEL_H+36)/2))
+PanelContainer.BackgroundTransparency=1; PanelContainer.BorderSizePixel=0
+PanelContainer.ZIndex=9; PanelContainer.Parent=ScreenGui
+
+local TabBar=Instance.new("Frame")
+TabBar.Size=UDim2.new(1,0,0,36); TabBar.BackgroundColor3=Color3.fromRGB(0,80,40)
+TabBar.BorderSizePixel=0; TabBar.ZIndex=10; TabBar.Parent=PanelContainer
+Instance.new("UICorner",TabBar).CornerRadius=UDim.new(0,12)
+local tbl=Instance.new("UIListLayout",TabBar)
+tbl.FillDirection=Enum.FillDirection.Horizontal
+tbl.HorizontalAlignment=Enum.HorizontalAlignment.Left
+tbl.VerticalAlignment=Enum.VerticalAlignment.Center
+tbl.Padding=UDim.new(0,4)
+local tbp=Instance.new("UIPadding",TabBar); tbp.PaddingLeft=UDim.new(0,6)
+
+local function makeTab(label)
+    local b=Instance.new("TextButton")
+    b.Size=UDim2.new(0,80,0,28); b.BackgroundColor3=Color3.fromRGB(0,120,60)
+    b.TextColor3=Color3.fromRGB(255,255,255); b.Text=label
+    b.Font=Enum.Font.Fondamento; b.TextSize=12; b.AutoButtonColor=false
+    b.ZIndex=11; b.Parent=TabBar
+    Instance.new("UICorner",b).CornerRadius=UDim.new(0,8)
+    return b
+end
+
+local Tab1Btn=makeTab("⚙ Sphere")
+local Tab2Btn=makeTab("⚔ Weapon")
+local Tab3Btn=makeTab("✦ Manip")
+
+local function makePanel()
+    local f=Instance.new("Frame")
+    f.Size=UDim2.new(1,0,0,PANEL_H); f.Position=UDim2.new(0,0,0,36)
+    f.BackgroundColor3=Color3.fromRGB(0,102,51); f.BorderSizePixel=0
+    f.ZIndex=10; f.Parent=PanelContainer
+    Instance.new("UICorner",f).CornerRadius=UDim.new(0,20)
+    return f
+end
+
+local MainFrame  = makePanel()
+local WeaponFrame= makePanel(); WeaponFrame.Visible=false
+local ManipFrame = makePanel(); ManipFrame.Visible=false
+
+local function setTab(idx)
+    MainFrame.Visible   = (idx==1)
+    WeaponFrame.Visible = (idx==2)
+    ManipFrame.Visible  = (idx==3)
+    Tab1Btn.BackgroundColor3 = idx==1 and Color3.fromRGB(50,205,50) or Color3.fromRGB(0,120,60)
+    Tab2Btn.BackgroundColor3 = idx==2 and Color3.fromRGB(50,205,50) or Color3.fromRGB(0,120,60)
+    Tab3Btn.BackgroundColor3 = idx==3 and Color3.fromRGB(50,205,50) or Color3.fromRGB(0,120,60)
+end
+
+Tab1Btn.MouseButton1Click:Connect(function() setTab(1); playSound("12221967") end)
+Tab2Btn.MouseButton1Click:Connect(function() setTab(2); playSound("12221967") end)
+Tab3Btn.MouseButton1Click:Connect(function() setTab(3); playSound("12221967") end)
+setTab(1)
+
+local function makeLabel(p,text,y,w,x)
+    w=w or 1; x=x or 0
+    local L=Instance.new("TextLabel")
+    L.Size=UDim2.new(w,-8,0,18); L.Position=UDim2.new(x,4,0,y)
+    L.Text=text; L.TextColor3=Color3.fromRGB(220,220,220)
+    L.BackgroundTransparency=1; L.Font=Enum.Font.Fondamento
+    L.TextSize=12; L.TextXAlignment=Enum.TextXAlignment.Left
+    L.ZIndex=11; L.Parent=p; return L
+end
+
+local function makeButton(p,text,y,w,x,bg,tc)
+    w=w or 0.8; x=x or 0.1
+    bg=bg or Color3.fromRGB(0,153,76); tc=tc or Color3.fromRGB(255,255,255)
+    local B=Instance.new("TextButton")
+    B.Size=UDim2.new(w,0,0,28); B.Position=UDim2.new(x,0,0,y)
+    B.Text=text; B.BackgroundColor3=bg; B.TextColor3=tc
+    B.Font=Enum.Font.Fondamento; B.TextSize=13; B.ZIndex=11; B.Parent=p
+    Instance.new("UICorner",B).CornerRadius=UDim.new(0,10)
+    return B
+end
+
+local function makeStepper(p,lbl,y,get,inc,dec)
+    makeLabel(p,lbl,y)
+    local d=makeButton(p,"-",y+16,0.2,0.1,Color3.fromRGB(200,80,0),Color3.fromRGB(255,255,255))
+    local disp=Instance.new("TextLabel")
+    disp.Size=UDim2.new(0.4,0,0,28); disp.Position=UDim2.new(0.3,0,0,y+16)
+    disp.Text=tostring(get()); disp.BackgroundColor3=Color3.fromRGB(20,60,30)
+    disp.TextColor3=Color3.fromRGB(255,255,255); disp.Font=Enum.Font.Fondamento
+    disp.TextSize=13; disp.ZIndex=11; disp.Parent=p
+    Instance.new("UICorner",disp).CornerRadius=UDim.new(0,8)
+    local i=makeButton(p,"+",y+16,0.2,0.7,Color3.fromRGB(0,180,80),Color3.fromRGB(255,255,255))
+    d.MouseButton1Click:Connect(function() dec(); disp.Text=tostring(get()); playSound("12221967") end)
+    i.MouseButton1Click:Connect(function() inc(); disp.Text=tostring(get()); playSound("12221967") end)
+    return disp
+end
+
+-- ─── TAB 1 — SPHERE ──────────────────────────────────────────────────────────
+local T1=Instance.new("TextLabel")
+T1.Size=UDim2.new(1,0,0,36); T1.Text="Lil0darkie6 Sphere v10"
+T1.TextColor3=Color3.fromRGB(255,255,255); T1.BackgroundColor3=Color3.fromRGB(0,153,76)
+T1.Font=Enum.Font.Fondamento; T1.TextSize=15; T1.ZIndex=11; T1.Parent=MainFrame
+Instance.new("UICorner",T1).CornerRadius=UDim.new(0,20)
+
+local MinBtn=makeButton(MainFrame,"-",4,0,0,Color3.fromRGB(0,200,80))
+MinBtn.Size=UDim2.new(0,28,0,28); MinBtn.Position=UDim2.new(1,-32,0,4)
+
+local ToggleBtn  = makeButton(MainFrame,"Sphere Off",      42, 0.8,0.1,Color3.fromRGB(255,0,0))
+local LockBtn    = makeButton(MainFrame,"Set Center To Me",76, 0.8,0.1,Color3.fromRGB(0,150,255))
+
+makeLabel(MainFrame,"Shape",112)
+local ShpL=makeButton(MainFrame,"<",128,0.15,0.05,Color3.fromRGB(80,80,160))
+local ShpD=Instance.new("TextLabel")
+ShpD.Size=UDim2.new(0.6,0,0,28); ShpD.Position=UDim2.new(0.2,0,0,128)
+ShpD.Text=SHAPES[shapeIndex]; ShpD.BackgroundColor3=Color3.fromRGB(20,60,30)
+ShpD.TextColor3=Color3.fromRGB(255,255,255); ShpD.Font=Enum.Font.Fondamento
+ShpD.TextSize=14; ShpD.ZIndex=11; ShpD.Parent=MainFrame
+Instance.new("UICorner",ShpD).CornerRadius=UDim.new(0,8)
+local ShpR=makeButton(MainFrame,">",128,0.15,0.8,Color3.fromRGB(80,80,160))
+ShpL.MouseButton1Click:Connect(function() shapeIndex=((shapeIndex-2)%#SHAPES)+1; ShpD.Text=SHAPES[shapeIndex]; playSound("12221967") end)
+ShpR.MouseButton1Click:Connect(function() shapeIndex=(shapeIndex%#SHAPES)+1; ShpD.Text=SHAPES[shapeIndex]; playSound("12221967") end)
+
+makeLabel(MainFrame,"Radius",162)
+local radDec=makeButton(MainFrame,"-",178,0.2,0.1,Color3.fromRGB(200,80,0))
+local radDisp=Instance.new("TextBox")
+radDisp.Size=UDim2.new(0.4,0,0,28); radDisp.Position=UDim2.new(0.3,0,0,178)
+radDisp.Text=tostring(radius); radDisp.BackgroundColor3=Color3.fromRGB(20,60,30)
+radDisp.TextColor3=Color3.fromRGB(255,255,255); radDisp.Font=Enum.Font.Fondamento
+radDisp.TextSize=13; radDisp.ClearTextOnFocus=false; radDisp.ZIndex=11; radDisp.Parent=MainFrame
+Instance.new("UICorner",radDisp).CornerRadius=UDim.new(0,8)
+local radInc=makeButton(MainFrame,"+",178,0.2,0.7,Color3.fromRGB(0,180,80))
+radDec.MouseButton1Click:Connect(function() radius=math.max(1,radius-5); radDisp.Text=tostring(radius); playSound("12221967") end)
+radInc.MouseButton1Click:Connect(function() radius=math.min(100000,radius+5); radDisp.Text=tostring(radius); playSound("12221967") end)
+radDisp.FocusLost:Connect(function() local v=tonumber(radDisp.Text); if v then radius=math.clamp(v,1,100000) end; radDisp.Text=tostring(radius) end)
+
+makeStepper(MainFrame,"Grid Spacing",214,function() return gridSpacing end,function() gridSpacing=math.min(200,gridSpacing+1) end,function() gridSpacing=math.max(1,gridSpacing-1) end)
+makeStepper(MainFrame,"Helix Turns",262, function() return helixTurns  end,function() helixTurns=math.min(20,helixTurns+1)   end,function() helixTurns=math.max(1,helixTurns-1)   end)
+makeStepper(MainFrame,"Helix Height",310,function() return helixHeight  end,function() helixHeight=math.min(500,helixHeight+10) end,function() helixHeight=math.max(10,helixHeight-10) end)
+
+local StealBtn     = makeButton(MainFrame,"Steal: Off",      358,0.8,0.1,Color3.fromRGB(180,0,0))
+local RingBtn      = makeButton(MainFrame,"Pull Ring: Off",  392,0.8,0.1,Color3.fromRGB(100,0,200))
+local TouchMoveBtn = makeButton(MainFrame,"Touch Move: Off", 426,0.8,0.1,Color3.fromRGB(0,100,180))
+local FlyBtn       = makeButton(MainFrame,"Fly: Off",        460,0.8,0.1,Color3.fromRGB(80,0,180))
+local flySpeed=60
+makeStepper(MainFrame,"Fly Speed",494,function() return flySpeed end,function() flySpeed=math.min(500,flySpeed+10) end,function() flySpeed=math.max(10,flySpeed-10) end)
+
+local WM1=Instance.new("TextLabel")
+WM1.Size=UDim2.new(1,0,0,16); WM1.Position=UDim2.new(0,0,1,-18)
+WM1.Text="Lil0darkie6 v10 [WEAPON FORGE] by Zeus!"
+WM1.TextColor3=Color3.fromRGB(200,200,200); WM1.BackgroundTransparency=1
+WM1.Font=Enum.Font.Fondamento; WM1.TextSize=11; WM1.ZIndex=11; WM1.Parent=MainFrame
+
+local minimized=false
+MinBtn.MouseButton1Click:Connect(function()
+    minimized=not minimized; MinBtn.Text=minimized and "+" or "-"
+    TabBar.Visible=not minimized; MainFrame.Visible=not minimized
+    WeaponFrame.Visible=false; ManipFrame.Visible=false
+    PanelContainer.Size=minimized and UDim2.new(0,PANEL_W,0,40) or UDim2.new(0,PANEL_W,0,PANEL_H+36)
+    if not minimized then setTab(1) end
+end)
+
+-- drag
+local dragging,dragInput,dragStart,startPos
+PanelContainer.InputBegan:Connect(function(i)
+    if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then
+        dragging=true; dragStart=i.Position; startPos=PanelContainer.Position
+        i.Changed:Connect(function() if i.UserInputState==Enum.UserInputState.End then dragging=false end end)
+    end
+end)
+PanelContainer.InputChanged:Connect(function(i)
+    if i.UserInputType==Enum.UserInputType.MouseMovement or i.UserInputType==Enum.UserInputType.Touch then dragInput=i end
+end)
+UserInputService.InputChanged:Connect(function(i)
+    if i==dragInput and dragging then
+        local d=i.Position-dragStart
+        PanelContainer.Position=UDim2.new(startPos.X.Scale,startPos.X.Offset+d.X,startPos.Y.Scale,startPos.Y.Offset+d.Y)
+    end
+end)
+
+-- ─── JOYSTICK ────────────────────────────────────────────────────────────────
+local DragPad=Instance.new("Frame")
+DragPad.Size=UDim2.new(0,120,0,120); DragPad.Position=UDim2.new(1,-140,1,-140)
+DragPad.BackgroundColor3=Color3.fromRGB(255,255,255); DragPad.BackgroundTransparency=0.7
+DragPad.BorderSizePixel=0; DragPad.ZIndex=10; DragPad.Parent=ScreenGui
+Instance.new("UICorner",DragPad).CornerRadius=UDim.new(1,0)
+
+local DragKnob=Instance.new("Frame")
+DragKnob.Size=UDim2.new(0,44,0,44); DragKnob.Position=UDim2.new(0.5,-22,0.5,-22)
+DragKnob.BackgroundColor3=Color3.fromRGB(0,200,120); DragKnob.BackgroundTransparency=0.2
+DragKnob.BorderSizePixel=0; DragKnob.ZIndex=11; DragKnob.Parent=DragPad
+Instance.new("UICorner",DragKnob).CornerRadius=UDim.new(1,0)
+
+local DragLbl=Instance.new("TextLabel")
+DragLbl.Size=UDim2.new(1,0,0,16); DragLbl.Position=UDim2.new(0,0,1,4)
+DragLbl.Text="drag sphere / weapon"; DragLbl.TextColor3=Color3.fromRGB(255,255,255)
+DragLbl.BackgroundTransparency=1; DragLbl.Font=Enum.Font.Fondamento
+DragLbl.TextSize=11; DragLbl.ZIndex=11; DragLbl.Parent=DragPad
+
+local jsActive=false; local jsTouchId=nil
+local jsOrigin=Vector2.new(); local jsDelta=Vector2.new()
+local JS_RADIUS=50; local SPHERE_SPD=0.6
+
+local function applyJsDelta(dt)
+    if not jsActive then return end
+    local cam=Workspace.CurrentCamera; local cf=cam and cam.CFrame or CFrame.new()
+    local fwd=Vector3.new(cf.LookVector.X,0,cf.LookVector.Z).Unit
+    local rgt=Vector3.new(cf.RightVector.X,0,cf.RightVector.Z).Unit
+    local move=(rgt*jsDelta.X+fwd*(-jsDelta.Y))*SPHERE_SPD*dt
+    staticCenterPosition=staticCenterPosition+move; Part.Position=staticCenterPosition
+end
+
+local function clampKnob(d) local m=d.Magnitude; return m>JS_RADIUS and (d/m*JS_RADIUS) or d end
+local function updateKnob(sd) jsDelta=clampKnob(sd); DragKnob.Position=UDim2.new(0.5,jsDelta.X-22,0.5,jsDelta.Y-22) end
+local function resetKnob() jsActive=false; jsTouchId=nil; jsDelta=Vector2.new(); DragKnob.Position=UDim2.new(0.5,-22,0.5,-22) end
+
+DragPad.InputBegan:Connect(function(i)
+    if (i.UserInputType==Enum.UserInputType.Touch or i.UserInputType==Enum.UserInputType.MouseButton1) and not jsActive then
+        jsActive=true; jsTouchId=i; jsOrigin=Vector2.new(i.Position.X,i.Position.Y)
+    end
+end)
+UserInputService.InputChanged:Connect(function(i)
+    if jsActive and i==jsTouchId then updateKnob(Vector2.new(i.Position.X,i.Position.Y)-jsOrigin) end
+end)
+UserInputService.InputEnded:Connect(function(i) if i==jsTouchId then resetKnob() end end)
+RunService.Heartbeat:Connect(function(dt) applyJsDelta(dt) end)
+
+-- ─── Part Pool ────────────────────────────────────────────────────────────────
+local sphereEnabled=false; local STEAL_ENABLED=false
+local attractionStrength=9e8; local STEAL_STRENGTH=HAMMER_SPEED
+
+local function ForcePart(v)
+    if v:IsA("BasePart") and not v.Parent:FindFirstChild("Humanoid")
+    and not v.Parent:FindFirstChild("Head") and v.Name~="Handle" then
+        for _,x in next,v:GetChildren() do
+            if x:IsA("BodyAngularVelocity") or x:IsA("BodyForce") or x:IsA("BodyGyro")
+            or x:IsA("BodyPosition") or x:IsA("BodyThrust") or x:IsA("BodyVelocity")
+            or x:IsA("RocketPropulsion") then x:Destroy() end
+        end
+        for _,n in ipairs({"Attachment","AlignPosition","Torque"}) do
+            local c=v:FindFirstChild(n); if c then c:Destroy() end
+        end
+        v.CanCollide=false
+        v.CustomPhysicalProperties=PhysicalProperties.new(0,0,0,0,0)
+        local T=Instance.new("Torque",v); T.Torque=Vector3.new(1e9,1e9,1e9)
+        local A2=Instance.new("Attachment",v); T.Attachment0=A2
+        local AP=Instance.new("AlignPosition",v)
+        AP.MaxForce=MAX_FORCE; AP.MaxVelocity=MAX_VELOCITY; AP.Responsiveness=MAX_RESPONSE
+        AP.Attachment0=A2; AP.Attachment1=Attachment1
+    end
+end
+
+local function isEligiblePart(part)
+    if not part:IsA("BasePart") then return false end
+    if part.Anchored then return false end
+    if not part:IsDescendantOf(Workspace) then return false end
+    if part:IsDescendantOf(Folder) then return false end
+    if LocalPlayer.Character and part:IsDescendantOf(LocalPlayer.Character) then return false end
+    local a=part.Parent
+    while a and a~=Workspace do
+        if a:FindFirstChild("Humanoid") or a:FindFirstChild("Head") then return false end
+        a=a.Parent
+    end
+    return true
+end
+
+local function addPart(part)
+    if isEligiblePart(part) and not table.find(parts,part) then
+        Network.RetainPart(part); ForcePart(part); table.insert(parts,part)
+        local idx=#parts
+        partAngles[part]={phi=math.acos(1-2*idx/math.max(idx,1)),theta=math.pi*(1+math.sqrt(5))*idx}
+    end
+end
+
+local function removePart(part)
+    local idx=table.find(parts,part)
+    if idx then table.remove(parts,idx); partAngles[part]=nil end
+    removePartFromRing(part)
+end
+
+for _,o in ipairs(Workspace:GetDescendants()) do addPart(o) end
+Workspace.DescendantAdded:Connect(addPart)
+Workspace.DescendantRemoving:Connect(removePart)
+RunService.Stepped:Connect(function()
+    for _,p in ipairs(Workspace:GetDescendants()) do
+        if p:IsA("BasePart") and not p.Anchored then addPart(p) end
+    end
+end)
+
+local t=0
+RunService.Heartbeat:Connect(function(dt)
+    if not sphereEnabled then return end
+    t=t+dt*rotSpeed
+    local center=staticCenterPosition; local count=#parts
+    for i,part in ipairs(parts) do
+        if part.Parent and not part.Anchored then
+            local target=getTargetPosition(i,count,t,center)
+            local dir=target-part.Position; local dist=dir.Magnitude
+            if dist>0 then
+                local speed=math.max(1e9,attractionStrength*math.max(1,dist*0.1))
+                part.Velocity=(dir/dist)*speed
+            end
+        end
+    end
+end)
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- ─── TAB 2 — WEAPON FORGE ────────────────────────────────────────────────────
+-- ═══════════════════════════════════════════════════════════════════════════════
+local WT=Instance.new("TextLabel")
+WT.Size=UDim2.new(1,0,0,36); WT.Text="⚔  Weapon Forge"
+WT.TextColor3=Color3.fromRGB(255,255,255); WT.BackgroundColor3=Color3.fromRGB(120,30,0)
+WT.Font=Enum.Font.Fondamento; WT.TextSize=17; WT.ZIndex=11; WT.Parent=WeaponFrame
+Instance.new("UICorner",WT).CornerRadius=UDim.new(0,20)
+
+makeLabel(WeaponFrame,"Select Weapon",44)
+
+-- weapon picker
+local WpnL=makeButton(WeaponFrame,"<",60,0.15,0.05,Color3.fromRGB(80,40,160))
+local WpnD=Instance.new("TextLabel")
+WpnD.Size=UDim2.new(0.6,0,0,28); WpnD.Position=UDim2.new(0.2,0,0,60)
+WpnD.Text=WEAPON_NAMES[weaponIndex]; WpnD.BackgroundColor3=Color3.fromRGB(40,20,10)
+WpnD.TextColor3=Color3.fromRGB(255,200,100); WpnD.Font=Enum.Font.Fondamento
+WpnD.TextSize=14; WpnD.ZIndex=11; WpnD.Parent=WeaponFrame
+Instance.new("UICorner",WpnD).CornerRadius=UDim.new(0,8)
+local WpnR=makeButton(WeaponFrame,">",60,0.15,0.8,Color3.fromRGB(80,40,160))
+
+WpnL.MouseButton1Click:Connect(function()
+    weaponIndex=((weaponIndex-2)%#WEAPON_NAMES)+1
+    WpnD.Text=WEAPON_NAMES[weaponIndex]; playSound("12221967")
+end)
+WpnR.MouseButton1Click:Connect(function()
+    weaponIndex=(weaponIndex%#WEAPON_NAMES)+1
+    WpnD.Text=WEAPON_NAMES[weaponIndex]; playSound("12221967")
+end)
+
+-- forge / drop button
+local ForgeBtn=makeButton(WeaponFrame,"⚔  Forge Weapon",96,0.8,0.1,Color3.fromRGB(160,80,0))
+ForgeBtn.MouseButton1Click:Connect(function()
+    local name=WEAPON_NAMES[weaponIndex]
+    if weaponEnabled and name=="None" then
+        disableWeapon()
+        ForgeBtn.Text="⚔  Forge Weapon"
+        ForgeBtn.BackgroundColor3=Color3.fromRGB(160,80,0)
+    elseif name=="None" then
+        disableWeapon()
+    else
+        enableWeapon(name)
+        ForgeBtn.Text="💥  Drop Weapon"
+        ForgeBtn.BackgroundColor3=Color3.fromRGB(180,20,20)
+    end
+    playSound("12221967")
+end)
+
+local DropBtn=makeButton(WeaponFrame,"💥  Drop & Scatter",132,0.8,0.1,Color3.fromRGB(120,0,0))
+DropBtn.MouseButton1Click:Connect(function()
+    -- scatter weapon parts outward
+    local center=staticCenterPosition
+    for _,p in ipairs(weaponParts) do
+        if p and p.Parent then
+            for _,n in ipairs({"WeaponAtt","WeaponAP","WeaponTorque"}) do
+                local c=p:FindFirstChild(n); if c then c:Destroy() end
+            end
+            local dir=p.Position-center
+            if dir.Magnitude<0.1 then dir=Vector3.new(math.random()-0.5,0.5,math.random()-0.5) end
+            pcall(function() p.Velocity=dir.Unit*500 end)
+        end
+    end
+    weaponParts={}; destroyWeaponAnchors(); weaponEnabled=false
+    ForgeBtn.Text="⚔  Forge Weapon"; ForgeBtn.BackgroundColor3=Color3.fromRGB(160,80,0)
+    playSound("12221967")
+end)
+
+-- weapon origin offset stepper (distance in front of sphere)
+makeStepper(WeaponFrame,"Weapon Distance",172,
+    function() return math.floor(weaponOriginOffset.Z) end,
+    function() weaponOriginOffset=Vector3.new(weaponOriginOffset.X,weaponOriginOffset.Y,math.min(60,weaponOriginOffset.Z+2)) end,
+    function() weaponOriginOffset=Vector3.new(weaponOriginOffset.X,weaponOriginOffset.Y,math.max(2,weaponOriginOffset.Z-2))  end
+)
+makeStepper(WeaponFrame,"Weapon Height",220,
+    function() return math.floor(weaponOriginOffset.Y) end,
+    function() weaponOriginOffset=Vector3.new(weaponOriginOffset.X,math.min(20,weaponOriginOffset.Y+1),weaponOriginOffset.Z) end,
+    function() weaponOriginOffset=Vector3.new(weaponOriginOffset.X,math.max(-10,weaponOriginOffset.Y-1),weaponOriginOffset.Z) end
+)
+
+-- part count display
+local WpnCountLbl=makeLabel(WeaponFrame,"weapon parts: 0",268)
+RunService.Heartbeat:Connect(function()
+    if WeaponFrame.Visible then
+        WpnCountLbl.Text=string.format("weapon parts: %d | enabled: %s",#weaponParts,tostring(weaponEnabled))
+    end
+end)
+
+local WM_W=Instance.new("TextLabel")
+WM_W.Size=UDim2.new(1,0,0,16); WM_W.Position=UDim2.new(0,0,1,-18)
+WM_W.Text="joystick moves sphere + weapon together"
+WM_W.TextColor3=Color3.fromRGB(180,180,180); WM_W.BackgroundTransparency=1
+WM_W.Font=Enum.Font.Fondamento; WM_W.TextSize=10; WM_W.ZIndex=11; WM_W.Parent=WeaponFrame
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- ─── TAB 3 — MANIPULATION ────────────────────────────────────────────────────
+-- ═══════════════════════════════════════════════════════════════════════════════
+local T3=Instance.new("TextLabel")
+T3.Size=UDim2.new(1,0,0,36); T3.Text="Part Manipulator"
+T3.TextColor3=Color3.fromRGB(255,255,255); T3.BackgroundColor3=Color3.fromRGB(0,100,160)
+T3.Font=Enum.Font.Fondamento; T3.TextSize=17; T3.ZIndex=11; T3.Parent=ManipFrame
+Instance.new("UICorner",T3).CornerRadius=UDim.new(0,20)
+
+local CountLbl=makeLabel(ManipFrame,"Claimed: 0 parts",44); CountLbl.TextSize=13
+RunService.Heartbeat:Connect(function()
+    if ManipFrame.Visible then CountLbl.Text=string.format("Claimed: %d parts",#getClaimedParts()) end
+end)
+
+makeLabel(ManipFrame,"── Nudge All ──",68)
+local nudgeDirs={
+    {label="▲ Up",dir=Vector3.new(0,1,0)},  {label="▼ Down",dir=Vector3.new(0,-1,0)},
+    {label="◀ Left",dir=Vector3.new(-1,0,0)},{label="▶ Right",dir=Vector3.new(1,0,0)},
+    {label="▲ Fwd",dir=Vector3.new(0,0,-1)}, {label="▼ Back",dir=Vector3.new(0,0,1)},
+}
+local nudgeY=86
+for i,nd in ipairs(nudgeDirs) do
+    local col=((i-1)%2); local row=math.floor((i-1)/2)
+    local btnX=col==0 and 0.05 or 0.52
+    local btn=makeButton(ManipFrame,nd.label,nudgeY+row*34,0.43,btnX,Color3.fromRGB(30,100,160))
+    local dir=nd.dir
+    btn.MouseButton1Click:Connect(function()
+        local cam=Workspace.CurrentCamera; local cf=cam and cam.CFrame or CFrame.new()
+        local mapped=dir
+        if dir==Vector3.new(-1,0,0) then mapped=-Vector3.new(cf.RightVector.X,0,cf.RightVector.Z).Unit
+        elseif dir==Vector3.new(1,0,0) then mapped=Vector3.new(cf.RightVector.X,0,cf.RightVector.Z).Unit
+        elseif dir==Vector3.new(0,0,-1) then mapped=Vector3.new(cf.LookVector.X,0,cf.LookVector.Z).Unit
+        elseif dir==Vector3.new(0,0,1) then mapped=-Vector3.new(cf.LookVector.X,0,cf.LookVector.Z).Unit end
+        nudgeAll(mapped,NUDGE_AMT); playSound("12221967")
+    end)
+end
+
+local nudgeY2=nudgeY+3*34+6
+makeStepper(ManipFrame,"Nudge Force",nudgeY2,function() return NUDGE_AMT end,function() NUDGE_AMT=math.min(10000,NUDGE_AMT+50) end,function() NUDGE_AMT=math.max(1,NUDGE_AMT-50) end)
+
+local flingY=nudgeY2+50; makeLabel(ManipFrame,"── Fling ──",flingY)
+local FlingUpBtn =makeButton(ManipFrame,"⬆  Fling Up",   flingY+18,0.43,0.05,Color3.fromRGB(160,80,0))
+local FlingOutBtn=makeButton(ManipFrame,"💥  Explode",   flingY+18,0.43,0.52,Color3.fromRGB(160,30,0))
+FlingUpBtn.MouseButton1Click:Connect(function()
+    for _,p in ipairs(getClaimedParts()) do if p and p.Parent then pcall(function() p.Velocity=Vector3.new(0,NUDGE_AMT*10,0) end) end end
+    playSound("12221967")
+end)
+FlingOutBtn.MouseButton1Click:Connect(function()
+    local center=staticCenterPosition
+    for _,p in ipairs(getClaimedParts()) do
+        if p and p.Parent then
+            local d=p.Position-center; if d.Magnitude<0.01 then d=Vector3.new(math.random()-0.5,math.random()-0.5,math.random()-0.5) end
+            pcall(function() p.Velocity=d.Unit*NUDGE_AMT*10 end)
+        end
+    end; playSound("12221967")
+end)
+
+local vacY=flingY+54; makeLabel(ManipFrame,"── Vacuum ──",vacY)
+local VacBtn=makeButton(ManipFrame,"🌀  Vacuum To Center",vacY+18,0.9,0.05,Color3.fromRGB(80,0,160))
+VacBtn.MouseButton1Click:Connect(function()
+    local center=staticCenterPosition
+    for _,p in ipairs(getClaimedParts()) do
+        if p and p.Parent then local d=center-p.Position; if d.Magnitude>0 then pcall(function() p.Velocity=d.Unit*NUDGE_AMT*10 end) end end
+    end; playSound("12221967")
+end)
+
+local spinY=vacY+54; makeLabel(ManipFrame,"── Continuous ──",spinY)
+local SpinBtn  =makeButton(ManipFrame,"Spin: Off",  spinY+18,0.43,0.05,Color3.fromRGB(100,0,200))
+local FreezeBtn=makeButton(ManipFrame,"Freeze: Off",spinY+18,0.43,0.52,Color3.fromRGB(0,80,180))
+SpinBtn.MouseButton1Click:Connect(function()
+    MANIP_SPIN_ENABLED=not MANIP_SPIN_ENABLED
+    SpinBtn.Text=MANIP_SPIN_ENABLED and "Spin: On" or "Spin: Off"
+    SpinBtn.BackgroundColor3=MANIP_SPIN_ENABLED and Color3.fromRGB(50,205,50) or Color3.fromRGB(100,0,200); playSound("12221967")
+end)
+FreezeBtn.MouseButton1Click:Connect(function()
+    MANIP_FREEZE_ENABLED=not MANIP_FREEZE_ENABLED
+    FreezeBtn.Text=MANIP_FREEZE_ENABLED and "Freeze: On" or "Freeze: Off"
+    FreezeBtn.BackgroundColor3=MANIP_FREEZE_ENABLED and Color3.fromRGB(50,180,255) or Color3.fromRGB(0,80,180); playSound("12221967")
+end)
+makeStepper(ManipFrame,"Spin Speed",spinY+54,function() return MANIP_SPIN_SPEED end,function() MANIP_SPIN_SPEED=math.min(10000,MANIP_SPIN_SPEED+100) end,function() MANIP_SPIN_SPEED=math.max(0,MANIP_SPIN_SPEED-100) end)
+
+local zeroY=spinY+108
+local ZeroBtn=makeButton(ManipFrame,"⏹  Zero All Velocity",zeroY,0.9,0.05,Color3.fromRGB(40,40,40))
+ZeroBtn.MouseButton1Click:Connect(function()
+    for _,p in ipairs(getClaimedParts()) do if p and p.Parent then pcall(function() p.Velocity=Vector3.zero; p.RotVelocity=Vector3.zero end) end end
+    playSound("12221967")
+end)
+
+local WM3=Instance.new("TextLabel")
+WM3.Size=UDim2.new(1,0,0,16); WM3.Position=UDim2.new(0,0,1,-18)
+WM3.Text="Lil0darkie6 v10 [WEAPON FORGE] by Zeus!"
+WM3.TextColor3=Color3.fromRGB(200,200,200); WM3.BackgroundTransparency=1
+WM3.Font=Enum.Font.Fondamento; WM3.TextSize=11; WM3.ZIndex=11; WM3.Parent=ManipFrame
+
+-- ─── Tab 1 Button Logic ──────────────────────────────────────────────────────
+local sphereOn=false
+ToggleBtn.MouseButton1Click:Connect(function()
+    sphereOn=not sphereOn; sphereEnabled=sphereOn
+    if sphereOn and LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart") then
+        staticCenterPosition=LocalPlayer.Character.HumanoidRootPart.Position; Part.Position=staticCenterPosition
+    end
+    ToggleBtn.Text=sphereOn and "Sphere On" or "Sphere Off"
+    ToggleBtn.BackgroundColor3=sphereOn and Color3.fromRGB(50,205,50) or Color3.fromRGB(255,0,0); playSound("12221967")
+end)
+LockBtn.MouseButton1Click:Connect(function()
+    if LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart") then
+        staticCenterPosition=LocalPlayer.Character.HumanoidRootPart.Position; Part.Position=staticCenterPosition; playSound("12221967")
+    end
+end)
+
+local stealOn=false
+StealBtn.MouseButton1Click:Connect(function()
+    stealOn=not stealOn; STEAL_ENABLED=stealOn
+    StealBtn.Text=stealOn and "Steal: On" or "Steal: Off"
+    StealBtn.BackgroundColor3=stealOn and Color3.fromRGB(50,205,50) or Color3.fromRGB(180,0,0); playSound("12221967")
+end)
+
+local ringOn=false
+RingBtn.MouseButton1Click:Connect(function()
+    ringOn=not ringOn
+    if ringOn then enableRing(); RingBtn.Text="Pull Ring: On";  RingBtn.BackgroundColor3=Color3.fromRGB(50,205,50)
+    else            disableRing(); RingBtn.Text="Pull Ring: Off"; RingBtn.BackgroundColor3=Color3.fromRGB(100,0,200) end
+    playSound("12221967")
+end)
+
+local touchMoveOn=false
+TouchMoveBtn.MouseButton1Click:Connect(function()
+    touchMoveOn=not touchMoveOn; TOUCH_MOVE_ENABLED=touchMoveOn; TouchOverlay.Visible=touchMoveOn
+    TouchMoveBtn.Text=touchMoveOn and "Touch Move: On" or "Touch Move: Off"
+    TouchMoveBtn.BackgroundColor3=touchMoveOn and Color3.fromRGB(50,205,50) or Color3.fromRGB(0,100,180)
+    if not touchMoveOn then activeTouches={} end; playSound("12221967")
+end)
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- ─── FLY SYSTEM ──────────────────────────────────────────────────────────────
+-- ═══════════════════════════════════════════════════════════════════════════════
+local flyEnabled=false; local flyBodyVel=nil; local flyBodyGyro=nil
+local leftWing=nil; local rightWing=nil; local wingConn=nil
+local WING_COLOR=Color3.fromRGB(120,60,220); local WING_TRAIL=Color3.fromRGB(180,120,255)
+
+local function buildWing(isLeft)
+    local weld=Instance.new("Weld")
+    local wing=Instance.new("Part"); wing.Name=isLeft and "LeftWing" or "RightWing"
+    wing.Size=Vector3.new(0.2,2.5,4.5); wing.Anchored=false; wing.CanCollide=false
+    wing.CastShadow=false; wing.Material=Enum.Material.Neon; wing.Color=WING_COLOR
+    wing.Transparency=0.15; wing.Parent=character
+    local tip=Instance.new("Part"); tip.Name=isLeft and "LeftWingTip" or "RightWingTip"
+    tip.Size=Vector3.new(0.1,1.0,2.0); tip.Anchored=false; tip.CanCollide=false
+    tip.CastShadow=false; tip.Material=Enum.Material.Neon; tip.Color=WING_TRAIL
+    tip.Transparency=0.25; tip.Parent=character
+    local tw=Instance.new("Weld"); tw.Part0=wing; tw.Part1=tip
+    tw.C0=isLeft and CFrame.new(0,-1.2,-2.2)*CFrame.Angles(0,0,math.rad(-18)) or CFrame.new(0,-1.2,2.2)*CFrame.Angles(0,0,math.rad(18))
+    tw.Parent=wing
+    local a0=Instance.new("Attachment",wing); local a1=Instance.new("Attachment",wing)
+    a0.Position=Vector3.new(0,0,isLeft and -2 or 2); a1.Position=Vector3.new(0,0,isLeft and 2 or -2)
+    local tr=Instance.new("Trail"); tr.Attachment0=a0; tr.Attachment1=a1
+    tr.Color=ColorSequence.new({ColorSequenceKeypoint.new(0,WING_TRAIL),ColorSequenceKeypoint.new(1,Color3.fromRGB(60,0,120))})
+    tr.Transparency=NumberSequence.new({NumberSequenceKeypoint.new(0,0.1),NumberSequenceKeypoint.new(1,1.0)})
+    tr.Lifetime=0.25; tr.MinLength=0; tr.FaceCamera=true; tr.Parent=wing
+    weld.Part0=humanoidRootPart; weld.Part1=wing
+    weld.C0=CFrame.new((isLeft and -1 or 1)*1.2,0.5,0.3); weld.Parent=wing
+    return wing,weld
+end
+
+local function destroyWings()
+    if leftWing  and leftWing.Parent  then leftWing:Destroy()  end
+    if rightWing and rightWing.Parent then rightWing:Destroy() end
+    leftWing=nil; rightWing=nil
+    if wingConn then wingConn:Disconnect(); wingConn=nil end
+end
+
+local function spawnWings()
+    destroyWings(); leftWing=buildWing(true); rightWing=buildWing(false)
+    local flapT=0; local flapSpd=3.5; local flapAmp=math.rad(42)
+    wingConn=RunService.Heartbeat:Connect(function(dt)
+        flapT=flapT+dt*flapSpd
+        local sf=1+(flySpeed/200); local fa=math.sin(flapT*sf)*flapAmp
+        local ta=math.sin(flapT*sf+math.pi*0.5)*math.rad(12)
+        local sh=(math.sin(flapT*2)+1)/2
+        local wc=Color3.new(0.47+sh*0.20,0.24+sh*0.12,0.86-sh*0.15)
+        for _,w in ipairs({leftWing,rightWing}) do
+            if w and w.Parent then
+                local wi=w:FindFirstChildWhichIsA("Weld")
+                if wi then local side=(w.Name=="LeftWing") and -1 or 1; wi.C0=CFrame.new(side*1.2,0.5,0.3)*CFrame.Angles(ta,0,side*fa) end
+                w.Color=wc
+            end
+        end
+        for _,tn in ipairs({"LeftWingTip","RightWingTip"}) do
+            local tip=character:FindFirstChild(tn)
+            if tip then tip.Color=Color3.new(0.70+sh*0.10,0.47+sh*0.08,1.00) end
+        end
+    end)
+end
+
+local function enableFly()
+    flyEnabled=true
+    humanoid:SetStateEnabled(Enum.HumanoidStateType.Freefall,false)
+    humanoid:SetStateEnabled(Enum.HumanoidStateType.Jumping,false)
+    flyBodyVel=Instance.new("BodyVelocity"); flyBodyVel.Velocity=Vector3.new(0,0,0)
+    flyBodyVel.MaxForce=Vector3.new(1e6,1e6,1e6); flyBodyVel.P=1e4; flyBodyVel.Parent=humanoidRootPart
+    flyBodyGyro=Instance.new("BodyGyro"); flyBodyGyro.MaxTorque=Vector3.new(1e6,1e6,1e6)
+    flyBodyGyro.P=1e4; flyBodyGyro.D=500; flyBodyGyro.CFrame=humanoidRootPart.CFrame; flyBodyGyro.Parent=humanoidRootPart
+    spawnWings(); playSound("12221967")
+end
+
+local function disableFly()
+    flyEnabled=false
+    if flyBodyVel  then flyBodyVel:Destroy();  flyBodyVel=nil  end
+    if flyBodyGyro then flyBodyGyro:Destroy(); flyBodyGyro=nil end
+    humanoid:SetStateEnabled(Enum.HumanoidStateType.Freefall,true)
+    humanoid:SetStateEnabled(Enum.HumanoidStateType.Jumping,true)
+    destroyWings(); playSound("12221967")
+end
+
+RunService.Heartbeat:Connect(function()
+    if not flyEnabled or not flyBodyVel or not flyBodyGyro then return end
+    local cam=Workspace.CurrentCamera; local cf=cam and cam.CFrame or CFrame.new()
+    local mv=Vector3.new(0,0,0)
+    if UserInputService:IsKeyDown(Enum.KeyCode.W) or UserInputService:IsKeyDown(Enum.KeyCode.Up)    then mv=mv+cf.LookVector  end
+    if UserInputService:IsKeyDown(Enum.KeyCode.S) or UserInputService:IsKeyDown(Enum.KeyCode.Down)  then mv=mv-cf.LookVector  end
+    if UserInputService:IsKeyDown(Enum.KeyCode.A) or UserInputService:IsKeyDown(Enum.KeyCode.Left)  then mv=mv-cf.RightVector end
+    if UserInputService:IsKeyDown(Enum.KeyCode.D) or UserInputService:IsKeyDown(Enum.KeyCode.Right) then mv=mv+cf.RightVector end
+    if UserInputService:IsKeyDown(Enum.KeyCode.E) then mv=mv+Vector3.new(0,1,0) end
+    if UserInputService:IsKeyDown(Enum.KeyCode.Q) then mv=mv-Vector3.new(0,1,0) end
+    flyBodyVel.Velocity=mv.Magnitude>0 and mv.Unit*flySpeed or Vector3.new(flyBodyVel.Velocity.X*0.85,0,flyBodyVel.Velocity.Z*0.85)
+    local lf=Vector3.new(cf.LookVector.X,0,cf.LookVector.Z)
+    if lf.Magnitude>0.01 then flyBodyGyro.CFrame=CFrame.lookAt(Vector3.new(0,0,0),lf) end
+end)
+
+FlyBtn.MouseButton1Click:Connect(function()
+    if flyEnabled then disableFly(); FlyBtn.Text="Fly: Off"; FlyBtn.BackgroundColor3=Color3.fromRGB(80,0,180)
+    else enableFly(); FlyBtn.Text="Fly: On"; FlyBtn.BackgroundColor3=Color3.fromRGB(50,205,50) end
+end)
+
+-- ─── Character Respawn ────────────────────────────────────────────────────────
+LocalPlayer.CharacterAdded:Connect(function(newChar)
+    character=newChar
+    humanoidRootPart=newChar:WaitForChild("HumanoidRootPart")
+    humanoid=newChar:WaitForChild("Humanoid")
+    task.wait(0.5); startWalkAnim(character,humanoid)
+    if flyEnabled then enableFly() end
+end)
+
+-- ─── Steal Engine ────────────────────────────────────────────────────────────
+RunService.Heartbeat:Connect(function()
+    if not STEAL_ENABLED then return end
+    for _,part in ipairs(Workspace:GetDescendants()) do
+        if isEligiblePart(part) then
+            addPart(part)
+            local dir=staticCenterPosition-part.Position
+            if dir.Magnitude>0 then part.Velocity=dir.Unit*HAMMER_SPEED end
+        end
+    end
+end)
+
+-- ─── Init ─────────────────────────────────────────────────────────────────────
+local ok,uid=pcall(function() return Players:GetUserIdFromNameAsync("Toolb0x3") end)
+if ok and uid then
+    local ok2,content=pcall(function() return Players:GetUserThumbnailAsync(uid,Enum.ThumbnailType.HeadShot,Enum.ThumbnailSize.Size420x420) end)
+    StarterGui:SetCore("SendNotification",{
+        Title="Lil0darkie6 v10 [WEAPON FORGE]",
+        Text="Sphere + Weapons + Max Force",
+        Icon=ok2 and content or "",
+        Duration=5
+    })
+end
+
+local function SendChat(msg)
+    pcall(function()
+        if TextChatService.ChatVersion==Enum.ChatVersion.TextChatService then
+            TextChatService.TextChannels.RBXGeneral:SendAsync(msg)
+        else
+            game:GetService("ReplicatedStorage").DefaultChatSystemChatEvents.SayMessageRequest:FireServer(msg,"All")
+        end
+    end)
+end
+SendChat(" hi ")
