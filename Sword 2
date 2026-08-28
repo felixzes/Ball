@@ -1,0 +1,837 @@
+--[[
+    Devil's Blade Formation — DieStupidNinja Edition
+    Shaped after: thick broad blade, swept horn crossguard,
+    eye-socket pommel, short wrapped grip
+    Finger drag + Follow coexist
+]]
+
+local Players          = game:GetService("Players")
+local RunService       = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local SoundService     = game:GetService("SoundService")
+local StarterGui       = game:GetService("StarterGui")
+local Workspace        = game:GetService("Workspace")
+local LocalPlayer      = Players.LocalPlayer
+
+local character        = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+local humanoidRootPart = character:WaitForChild("HumanoidRootPart")
+local humanoid         = character:WaitForChild("Humanoid")
+
+-- ─── Network ─────────────────────────────────────────────────────────────────
+if not getgenv().Network then
+    getgenv().Network = {
+        BaseParts = {},
+        Velocity  = Vector3.new(14.46, 14.46, 14.46),
+    }
+    local Network = getgenv().Network
+    Network.RetainPart = function(p)
+        if typeof(p) == "Instance" and p:IsA("BasePart") and p:IsDescendantOf(Workspace) then
+            if not table.find(Network.BaseParts, p) then
+                table.insert(Network.BaseParts, p)
+                p.CustomPhysicalProperties = PhysicalProperties.new(0,0,0,0,0)
+                p.CanCollide = false
+            end
+        end
+    end
+    LocalPlayer.ReplicationFocus = Workspace
+    RunService.Heartbeat:Connect(function()
+        pcall(function()
+            sethiddenproperty(LocalPlayer, "SimulationRadius",    100000)
+            sethiddenproperty(LocalPlayer, "MaxSimulationRadius", 100000)
+        end)
+        for _, p in pairs(getgenv().Network.BaseParts) do
+            if p:IsDescendantOf(Workspace) and p.Parent then
+                p.Velocity = getgenv().Network.Velocity
+            end
+        end
+    end)
+end
+
+-- ─── Folder + Master Anchor ───────────────────────────────────────────────────
+local Folder              = Instance.new("Folder", Workspace)
+local MasterAnchor        = Instance.new("Part", Folder)
+MasterAnchor.Anchored     = true
+MasterAnchor.CanCollide   = false
+MasterAnchor.Transparency = 1
+MasterAnchor.Size         = Vector3.new(1,1,1)
+MasterAnchor.Position     = humanoidRootPart.Position
+
+local centerPos = humanoidRootPart.Position
+
+-- ─── Sound ───────────────────────────────────────────────────────────────────
+local function playSound(id)
+    local s = Instance.new("Sound")
+    s.SoundId = "rbxassetid://" .. id
+    s.Parent  = SoundService
+    s:Play()
+    s.Ended:Connect(function() s:Destroy() end)
+end
+playSound("2865227271")
+
+-- ─── Orientation ─────────────────────────────────────────────────────────────
+local swordYaw   = 0
+local swordPitch = 0
+
+local function rotatePoint(x, y, z)
+    local cosY = math.cos(swordYaw);   local sinY = math.sin(swordYaw)
+    local cosP = math.cos(swordPitch); local sinP = math.sin(swordPitch)
+    local rx  = cosY*x - sinY*z
+    local rz  = sinY*x + cosY*z
+    local ry2 = cosP*y - sinP*rz
+    local rz2 = sinP*y + cosP*rz
+    return rx, ry2, rz2
+end
+
+--[[
+═══════════════════════════════════════════════════════
+  DEVIL'S BLADE — silhouette reference breakdown
+  Total Y span: 120 studs. Y=0 bottom, Y=120 tip.
+  Centered: pommel base at -60, tip at +60.
+
+  Y layout (bottom → top):
+    0  – 12   Pommel (large circular eye socket)
+    12 – 22   Grip (short wrapped handle)
+    22 – 26   Crossguard center block
+    26 – 26   Horn roots + swept horns extend ±X
+    26 – 42   Horn sweep zone (arcs outward and curves back)
+    42 – 50   Ricasso / blade root (widest point)
+    50 – 105  Blade body (broad, tapers slowly)
+    105– 120  Blade tip (fast taper to point)
+
+  Blade profile:
+    At Y=42:  halfWidth=14, halfDepth=2.5  ← widest
+    At Y=105: halfWidth=5,  halfDepth=1.2
+    At Y=120: halfWidth=0,  halfDepth=0    ← point
+
+  Horns:
+    Two swept curved horns rooted at Y≈26–28
+    Left horn arcs: X from −8 → −22, Y from 26 → 38, then curves back up
+    Right horn mirrors
+    Each horn also has a smaller inner fang below the main arc
+═══════════════════════════════════════════════════════
+]]
+
+-- blade cross-section at absolute Y
+local function bladeHW(y)
+    if y < 42 then return 14, 2.5 end
+    if y > 120 then return 0, 0 end
+    if y <= 105 then
+        local t = (y - 42) / (105 - 42)
+        return 14 - t * 9, 2.5 - t * 1.3
+    end
+    local t = (y - 105) / 15
+    return 5 * (1 - t), 1.2 * (1 - t)
+end
+
+-- ─── Section definitions ──────────────────────────────────────────────────────
+--[[
+  Each section: id, frac (relative particle count weight), solver function
+  Solver receives (j, n) → returns x, y, z local offset
+]]
+
+local TOTAL = 120
+
+local function goldenTheta(j) return (j * 2.399963) % (2*math.pi) end
+local function rand01(j, salt) return ((j * 1618 + salt * 31337) % 1000) / 1000 end
+
+local SECTIONS = {}
+
+-- ── 1. Pommel — large flat circle (eye socket ring + filled disc)
+table.insert(SECTIONS, { frac = 0.10, solve = function(j, n)
+    local lt    = (j-1)/(n-1+1e-9)
+    -- outer ring is denser, inner filled
+    local ring  = (lt < 0.55)  -- 55% on ring, 45% fill
+    local theta = goldenTheta(j)
+    local r
+    if ring then
+        r = 9 + rand01(j,1) * 2.5
+    else
+        r = rand01(j,2) ^ 0.5 * 8.5
+    end
+    local y = 4 + rand01(j,3) * 7   -- spread across Y 0–11
+    return r * math.cos(theta), y - TOTAL/2, r * math.sin(theta) * 0.35
+end})
+
+-- ── 2. Eye pupil — small ellipse in center of pommel
+table.insert(SECTIONS, { frac = 0.025, solve = function(j, n)
+    local theta = goldenTheta(j)
+    local r     = rand01(j,4) ^ 0.5 * 3.5
+    local y     = 5 + rand01(j,5) * 4
+    return r * math.cos(theta) * 1.2, y - TOTAL/2, r * math.sin(theta) * 0.5
+end})
+
+-- ── 3. Grip — narrow wrapped column
+table.insert(SECTIONS, { frac = 0.06, solve = function(j, n)
+    local lt    = (j-1)/(n-1+1e-9)
+    local y     = 12 + lt * 10
+    local theta = goldenTheta(j)
+    local r     = 2.2 + math.sin(lt * math.pi * 6) * 0.6   -- wrap ridges
+    r = r * (rand01(j,6) * 0.4 + 0.8)
+    return r * math.cos(theta), y - TOTAL/2, r * math.sin(theta) * 0.5
+end})
+
+-- ── 4. Crossguard center block — flat horizontal bar at Y≈22-28
+table.insert(SECTIONS, { frac = 0.03, solve = function(j, n)
+    local lt = (j-1)/(n-1+1e-9)
+    local x  = (lt - 0.5) * 20          -- ±10 wide
+    local y  = 22 + rand01(j,7) * 6
+    local z  = (rand01(j,8) - 0.5) * 4
+    return x, y - TOTAL/2, z
+end})
+
+-- ── 5. Left horn — large swept curved horn
+--    Arc: root at (-8, 26), sweeps to (-24, 34), curves tip back to (-18, 42)
+table.insert(SECTIONS, { frac = 0.07, solve = function(j, n)
+    local lt    = (j-1)/(n-1+1e-9)
+    -- parametric arc
+    local angle = lt * math.pi * 0.9          -- 0 → ~162°
+    local armR  = 10 + lt * 6                 -- grows as it sweeps
+    local cx    = -12; local cy = 30          -- arc center
+    local x     = cx + armR * math.cos(math.pi + angle * 0.7)
+    local y     = cy + armR * math.sin(angle) * 0.9
+    local z     = (rand01(j,9) - 0.5) * 2.5
+    -- thickness tapers toward tip
+    local thick = (1 - lt) * 3.5 + 0.6
+    x = x + (rand01(j,10) - 0.5) * thick
+    return x, y - TOTAL/2, z
+end})
+
+-- ── 6. Right horn — mirror of left
+table.insert(SECTIONS, { frac = 0.07, solve = function(j, n)
+    local lt    = (j-1)/(n-1+1e-9)
+    local angle = lt * math.pi * 0.9
+    local armR  = 10 + lt * 6
+    local cx    = 12; local cy = 30
+    local x     = cx - armR * math.cos(math.pi + angle * 0.7)
+    local y     = cy + armR * math.sin(angle) * 0.9
+    local z     = (rand01(j,11) - 0.5) * 2.5
+    local thick = (1 - lt) * 3.5 + 0.6
+    x = x + (rand01(j,12) - 0.5) * thick
+    return x, y - TOTAL/2, z
+end})
+
+-- ── 7. Left inner fang — smaller downward spur below main horn
+table.insert(SECTIONS, { frac = 0.03, solve = function(j, n)
+    local lt = (j-1)/(n-1+1e-9)
+    local x  = -6 - lt * 8
+    local y  = 24 - lt * 6          -- goes downward
+    local z  = (rand01(j,13) - 0.5) * 2
+    local t2 = (1-lt)*2.5+0.4
+    x = x + (rand01(j,14)-0.5)*t2
+    return x, y - TOTAL/2, z
+end})
+
+-- ── 8. Right inner fang
+table.insert(SECTIONS, { frac = 0.03, solve = function(j, n)
+    local lt = (j-1)/(n-1+1e-9)
+    local x  =  6 + lt * 8
+    local y  = 24 - lt * 6
+    local z  = (rand01(j,15) - 0.5) * 2
+    local t2 = (1-lt)*2.5+0.4
+    x = x + (rand01(j,16)-0.5)*t2
+    return x, y - TOTAL/2, z
+end})
+
+-- ── 9. Blade root / ricasso — widest section, flat broad plate
+table.insert(SECTIONS, { frac = 0.06, solve = function(j, n)
+    local lt    = (j-1)/(n-1+1e-9)
+    local y     = 42 + lt * 8
+    local hw, hd = bladeHW(y)
+    local theta = goldenTheta(j)
+    local r     = rand01(j,17)^0.5
+    return r*hw*math.cos(theta), y - TOTAL/2, r*hd*math.sin(theta)
+end})
+
+-- ── 10. Blade body — broad tapered body with fuller groove
+table.insert(SECTIONS, { frac = 0.28, solve = function(j, n)
+    local lt    = (j-1)/(n-1+1e-9)
+    local y     = 50 + lt * 55
+    local hw, hd = bladeHW(y)
+    local theta = goldenTheta(j)
+    local r     = rand01(j,18)^0.5
+    -- fuller: cluster some toward spine center
+    local inFuller = rand01(j,19) < 0.15
+    if inFuller then
+        return (rand01(j,20)-0.5)*hw*0.3, y - TOTAL/2, (rand01(j,21)-0.5)*0.3
+    end
+    return r*hw*math.cos(theta), y - TOTAL/2, r*hd*math.sin(theta)
+end})
+
+-- ── 11. Cutting edge emphasis — particles clustered toward ±X faces
+table.insert(SECTIONS, { frac = 0.08, solve = function(j, n)
+    local lt    = (j-1)/(n-1+1e-9)
+    local y     = 50 + lt * 55
+    local hw, hd = bladeHW(y)
+    local side  = (j % 2 == 0) and 1 or -1
+    local edge  = hw * 0.92 + (rand01(j,22)-0.5)*1.5
+    local z     = (rand01(j,23)-0.5)*hd*0.8
+    return side * edge, y - TOTAL/2, z
+end})
+
+-- ── 12. Spine / back edge — narrow line along Z center
+table.insert(SECTIONS, { frac = 0.03, solve = function(j, n)
+    local lt = (j-1)/(n-1+1e-9)
+    local y  = 50 + lt * 55
+    local hw, hd = bladeHW(y)
+    return (rand01(j,24)-0.5)*hw*0.12, y - TOTAL/2, (rand01(j,25)-0.5)*hd*0.25
+end})
+
+-- ── 13. Blade tip — fast taper to point
+table.insert(SECTIONS, { frac = 0.07, solve = function(j, n)
+    local lt    = (j-1)/(n-1+1e-9)
+    local y     = 105 + lt * 15
+    local hw, hd = bladeHW(y)
+    local theta = goldenTheta(j)
+    local r     = rand01(j,26)^0.4
+    return r*hw*math.cos(theta), y - TOTAL/2, r*hd*math.sin(theta)
+end})
+
+-- ── 14. Aura glow ring — loose halo around crossguard / pommel area
+table.insert(SECTIONS, { frac = 0.04, solve = function(j, n)
+    local theta = goldenTheta(j)
+    local r     = 13 + rand01(j,27) * 8
+    local y     = 18 + rand01(j,28) * 18
+    return r*math.cos(theta), y - TOTAL/2, r*math.sin(theta)*0.5
+end})
+
+-- ─── Section map builder ──────────────────────────────────────────────────────
+local function buildSectionMap(count)
+    local map        = {}
+    local totalFrac  = 0
+    for _, s in ipairs(SECTIONS) do totalFrac = totalFrac + s.frac end
+
+    local assigned = 0
+    local alloc    = {}
+    for si, s in ipairs(SECTIONS) do
+        local n = (si == #SECTIONS)
+            and (count - assigned)
+            or  math.max(1, math.floor(s.frac / totalFrac * count))
+        alloc[si] = n
+        assigned  = assigned + n
+    end
+
+    local idx = 1
+    for si, s in ipairs(SECTIONS) do
+        local n = alloc[si]
+        for j = 1, n do
+            if idx > count then break end
+            local x, y, z = s.solve(j, n)
+            map[idx] = { x=x, y=y, z=z }
+            idx = idx + 1
+        end
+    end
+    while idx <= count do
+        map[idx] = { x=0, y=TOTAL/2 - TOTAL/2, z=0 }
+        idx = idx + 1
+    end
+    return map
+end
+
+-- ─── Part pool ────────────────────────────────────────────────────────────────
+local parts      = {}
+local sectionMap = {}
+local lastCount  = 0
+
+local function isEligible(part)
+    if not part:IsA("BasePart") then return false end
+    if part.Anchored then return false end
+    if not part:IsDescendantOf(Workspace) then return false end
+    if part:IsDescendantOf(Folder) then return false end
+    if LocalPlayer.Character and part:IsDescendantOf(LocalPlayer.Character) then return false end
+    local a = part.Parent
+    while a and a ~= Workspace do
+        if a:FindFirstChild("Humanoid") or a:FindFirstChild("Head") then return false end
+        a = a.Parent
+    end
+    return true
+end
+
+local function forcePart(part)
+    for _, x in next, part:GetChildren() do
+        if x:IsA("BodyAngularVelocity") or x:IsA("BodyForce") or x:IsA("BodyGyro")
+        or x:IsA("BodyPosition") or x:IsA("BodyThrust") or x:IsA("BodyVelocity")
+        or x:IsA("RocketPropulsion") then x:Destroy() end
+    end
+    if part:FindFirstChild("SwordAttach") then part:FindFirstChild("SwordAttach"):Destroy() end
+    if part:FindFirstChild("SwordAlign")  then part:FindFirstChild("SwordAlign"):Destroy()  end
+    if part:FindFirstChild("SwordTorque") then part:FindFirstChild("SwordTorque"):Destroy() end
+    part.CanCollide = false
+    local att  = Instance.new("Attachment", part); att.Name  = "SwordAttach"
+    local torq = Instance.new("Torque",     part); torq.Name = "SwordTorque"
+    torq.Torque      = Vector3.new(1e5, 1e5, 1e5)
+    torq.Attachment0 = att
+    local nodeAtt         = Instance.new("Attachment", MasterAnchor)
+    local ap              = Instance.new("AlignPosition", part); ap.Name = "SwordAlign"
+    ap.MaxForce           = math.huge
+    ap.MaxVelocity        = math.huge
+    ap.Responsiveness     = 1000
+    ap.Attachment0        = att
+    ap.Attachment1        = nodeAtt
+    ap.Parent             = part
+end
+
+local function addPart(part)
+    if not isEligible(part) then return end
+    if table.find(parts, part) then return end
+    if getgenv().Network then getgenv().Network.RetainPart(part) end
+    forcePart(part)
+    table.insert(parts, part)
+end
+
+local function removePart(part)
+    local i = table.find(parts, part)
+    if i then table.remove(parts, i) end
+end
+
+for _, d in ipairs(Workspace:GetDescendants()) do addPart(d) end
+Workspace.DescendantAdded:Connect(addPart)
+Workspace.DescendantRemoving:Connect(removePart)
+RunService.Stepped:Connect(function()
+    for _, p in ipairs(Workspace:GetDescendants()) do
+        if p:IsA("BasePart") and not p.Anchored then addPart(p) end
+    end
+end)
+
+-- ─── Shape engine ─────────────────────────────────────────────────────────────
+local sphereEnabled = false
+
+RunService.Heartbeat:Connect(function()
+    if not sphereEnabled then return end
+    local count = #parts
+    if count ~= lastCount then
+        sectionMap = buildSectionMap(count)
+        lastCount  = count
+    end
+    for i, part in ipairs(parts) do
+        if part.Parent and not part.Anchored then
+            local slot = sectionMap[i]
+            if slot then
+                local rx, ry, rz = rotatePoint(slot.x, slot.y, slot.z)
+                local target     = centerPos + Vector3.new(rx, ry, rz)
+                local dir        = target - part.Position
+                if dir.Magnitude > 0 then
+                    part.Velocity = dir.Unit * 999999
+                end
+            end
+        end
+    end
+end)
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- ─── FOLLOW + FINGER DRAG COEXIST ────────────────────────────────────────────
+local followOn      = false
+local followDist    = 5
+local fingerDragOn  = false
+local fingerActive  = false
+local fingerTouchId = nil
+
+local function screenToWorld(screenPos)
+    local cam = Workspace.CurrentCamera
+    if not cam then return nil end
+    local unitRay = cam:ScreenPointToRay(screenPos.X, screenPos.Y)
+    local rp      = RaycastParams.new()
+    rp.FilterType = Enum.RaycastFilterType.Exclude
+    rp.FilterDescendantsInstances = { Folder, LocalPlayer.Character }
+    local result = Workspace:Raycast(unitRay.Origin, unitRay.Direction * 2000, rp)
+    if result then
+        return Vector3.new(result.Position.X, result.Position.Y + 5, result.Position.Z)
+    end
+    local planeY = centerPos.Y
+    local dir    = unitRay.Direction
+    if math.abs(dir.Y) < 0.0001 then return unitRay.Origin + dir * 200 end
+    local t = (planeY - unitRay.Origin.Y) / dir.Y
+    if t > 0 then return unitRay.Origin + dir * t end
+    return nil
+end
+
+RunService.Heartbeat:Connect(function()
+    if fingerActive then return end
+    if followOn and humanoidRootPart then
+        local cf      = humanoidRootPart.CFrame
+        local leftVec = -cf.RightVector
+        centerPos             = cf.Position + leftVec * followDist
+        MasterAnchor.Position = centerPos
+    end
+end)
+
+-- ─── GUI ──────────────────────────────────────────────────────────────────────
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name         = "DevilsBladeGUI"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.Parent       = LocalPlayer:WaitForChild("PlayerGui")
+
+-- finger overlay (built before MainFrame so ZIndex stays correct)
+local FingerOverlay = Instance.new("Frame")
+FingerOverlay.Size                   = UDim2.new(1, 0, 1, 0)
+FingerOverlay.BackgroundTransparency = 1
+FingerOverlay.BorderSizePixel        = 0
+FingerOverlay.ZIndex                 = 0
+FingerOverlay.Visible                = false
+FingerOverlay.Parent                 = ScreenGui
+
+local FingerDot = Instance.new("Frame")
+FingerDot.Size                   = UDim2.new(0, 26, 0, 26)
+FingerDot.AnchorPoint            = Vector2.new(0.5, 0.5)
+FingerDot.BackgroundColor3       = Color3.fromRGB(220, 40, 40)
+FingerDot.BackgroundTransparency = 0.15
+FingerDot.BorderSizePixel        = 0
+FingerDot.Visible                = false
+FingerDot.ZIndex                 = 10
+FingerDot.Parent                 = ScreenGui
+Instance.new("UICorner", FingerDot).CornerRadius = UDim.new(1, 0)
+
+local function applyDrag(screenPos)
+    local wp = screenToWorld(screenPos)
+    if not wp then return end
+    centerPos             = wp
+    MasterAnchor.Position = centerPos
+    FingerDot.Position    = UDim2.new(0, screenPos.X, 0, screenPos.Y)
+    FingerDot.Visible     = true
+end
+
+FingerOverlay.InputBegan:Connect(function(input)
+    if not fingerDragOn then return end
+    if input.UserInputType ~= Enum.UserInputType.Touch
+    and input.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
+    if fingerActive then return end
+    fingerActive  = true
+    fingerTouchId = input
+    applyDrag(Vector2.new(input.Position.X, input.Position.Y))
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+    if not fingerDragOn or not fingerActive then return end
+    if input ~= fingerTouchId then return end
+    if input.UserInputType ~= Enum.UserInputType.Touch
+    and input.UserInputType ~= Enum.UserInputType.MouseMovement then return end
+    applyDrag(Vector2.new(input.Position.X, input.Position.Y))
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+    if input ~= fingerTouchId then return end
+    fingerActive      = false
+    fingerTouchId     = nil
+    FingerDot.Visible = false
+end)
+
+-- ── Main frame ──
+local MainFrame = Instance.new("Frame")
+MainFrame.Size             = UDim2.new(0, 230, 0, 400)
+MainFrame.Position         = UDim2.new(0.5, -115, 0.5, -200)
+MainFrame.BackgroundColor3 = Color3.fromRGB(18, 4, 4)
+MainFrame.BorderSizePixel  = 0
+MainFrame.Parent           = ScreenGui
+Instance.new("UICorner", MainFrame).CornerRadius = UDim.new(0, 16)
+
+local function makeLabel(parent, text, y)
+    local L = Instance.new("TextLabel")
+    L.Size                   = UDim2.new(1, -8, 0, 18)
+    L.Position               = UDim2.new(0, 4, 0, y)
+    L.Text                   = text
+    L.TextColor3             = Color3.fromRGB(255, 180, 180)
+    L.BackgroundTransparency = 1
+    L.Font                   = Enum.Font.Fondamento
+    L.TextSize               = 12
+    L.TextXAlignment         = Enum.TextXAlignment.Left
+    L.Parent                 = parent
+    return L
+end
+
+local function makeButton(parent, text, y, w, x, bg, tc)
+    w  = w  or 0.8; x  = x  or 0.1
+    bg = bg or Color3.fromRGB(140, 0, 0)
+    tc = tc or Color3.fromRGB(255, 255, 255)
+    local B = Instance.new("TextButton")
+    B.Size             = UDim2.new(w, 0, 0, 28)
+    B.Position         = UDim2.new(x, 0, 0, y)
+    B.Text             = text
+    B.BackgroundColor3 = bg
+    B.TextColor3       = tc
+    B.Font             = Enum.Font.Fondamento
+    B.TextSize         = 14
+    B.BorderSizePixel  = 0
+    B.Parent           = parent
+    Instance.new("UICorner", B).CornerRadius = UDim.new(0, 10)
+    return B
+end
+
+local function makeStepper(parent, labelText, y, getValue, onInc, onDec)
+    makeLabel(parent, labelText, y)
+    local dec = makeButton(parent, "-", y+16, 0.2, 0.1, Color3.fromRGB(120, 30, 0))
+    local disp = Instance.new("TextLabel")
+    disp.Size             = UDim2.new(0.4, 0, 0, 28)
+    disp.Position         = UDim2.new(0.3, 0, 0, y+16)
+    disp.Text             = tostring(getValue())
+    disp.BackgroundColor3 = Color3.fromRGB(40, 8, 8)
+    disp.TextColor3       = Color3.fromRGB(255, 200, 200)
+    disp.Font             = Enum.Font.Fondamento
+    disp.TextSize         = 13
+    disp.BorderSizePixel  = 0
+    disp.Parent           = parent
+    Instance.new("UICorner", disp).CornerRadius = UDim.new(0, 8)
+    local inc = makeButton(parent, "+", y+16, 0.2, 0.7, Color3.fromRGB(180, 20, 0))
+    dec.MouseButton1Click:Connect(function()
+        onDec(); disp.Text = tostring(getValue()); playSound("12221967")
+    end)
+    inc.MouseButton1Click:Connect(function()
+        onInc(); disp.Text = tostring(getValue()); playSound("12221967")
+    end)
+    return disp
+end
+
+-- ── Title with DieStupidNinja icon ──
+local titleIcon = Instance.new("ImageLabel")
+titleIcon.Size                   = UDim2.new(0, 30, 0, 30)
+titleIcon.Position               = UDim2.new(0, 4, 0, 3)
+titleIcon.BackgroundTransparency = 1
+titleIcon.BorderSizePixel        = 0
+titleIcon.Parent                 = MainFrame
+Instance.new("UICorner", titleIcon).CornerRadius = UDim.new(1, 0)
+pcall(function()
+    local uid = Players:GetUserIdFromNameAsync("DieStupidNinja")
+    titleIcon.Image = Players:GetUserThumbnailAsync(uid,
+        Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size420x420)
+end)
+
+local Title = Instance.new("TextLabel")
+Title.Size             = UDim2.new(1, 0, 0, 36)
+Title.Text             = "Devil's Blade — DieStupidNinja"
+Title.TextColor3       = Color3.fromRGB(255, 80, 80)
+Title.BackgroundColor3 = Color3.fromRGB(100, 0, 0)
+Title.Font             = Enum.Font.Fondamento
+Title.TextSize         = 13
+Title.BorderSizePixel  = 0
+Title.Parent           = MainFrame
+Instance.new("UICorner", Title).CornerRadius = UDim.new(0, 16)
+
+-- ── Minimize ──
+local minimized   = false
+local MinimizeBtn = makeButton(MainFrame, "-", 4, 0, 0, Color3.fromRGB(160, 0, 0))
+MinimizeBtn.Size     = UDim2.new(0, 28, 0, 28)
+MinimizeBtn.Position = UDim2.new(1, -32, 0, 4)
+MinimizeBtn.ZIndex   = 10
+MinimizeBtn.MouseButton1Click:Connect(function()
+    minimized = not minimized
+    for _, child in ipairs(MainFrame:GetChildren()) do
+        if child ~= MinimizeBtn and child.Name ~= "UICorner" then
+            if child:IsA("GuiObject") then child.Visible = not minimized end
+        end
+    end
+    MinimizeBtn.Text = minimized and "+" or "-"
+    MainFrame.Size   = minimized
+        and UDim2.new(0, 230, 0, 40)
+        or  UDim2.new(0, 230, 0, 400)
+end)
+
+-- ── Toggle ──
+local toggleOn  = false
+local ToggleBtn = makeButton(MainFrame, "Sword: Off", 44, 0.8, 0.1, Color3.fromRGB(180, 0, 0))
+ToggleBtn.MouseButton1Click:Connect(function()
+    toggleOn      = not toggleOn
+    sphereEnabled = toggleOn
+    if toggleOn and humanoidRootPart then
+        centerPos             = humanoidRootPart.Position
+        MasterAnchor.Position = centerPos
+    end
+    ToggleBtn.Text             = toggleOn and "Sword: On"  or "Sword: Off"
+    ToggleBtn.BackgroundColor3 = toggleOn
+        and Color3.fromRGB(50, 205, 50) or Color3.fromRGB(180, 0, 0)
+    playSound("12221967")
+end)
+
+-- ── Set Center ──
+local SetCenterBtn = makeButton(MainFrame, "Set Center To Me", 78, 0.8, 0.1, Color3.fromRGB(0, 100, 180))
+SetCenterBtn.MouseButton1Click:Connect(function()
+    if humanoidRootPart then
+        centerPos             = humanoidRootPart.Position
+        MasterAnchor.Position = centerPos
+        playSound("12221967")
+    end
+end)
+
+-- ── Follow ──
+local FollowBtn = makeButton(MainFrame, "Follow: Off", 112, 0.8, 0.1, Color3.fromRGB(0, 90, 90))
+FollowBtn.MouseButton1Click:Connect(function()
+    followOn = not followOn
+    FollowBtn.Text             = followOn and "Follow: On"  or "Follow: Off"
+    FollowBtn.BackgroundColor3 = followOn
+        and Color3.fromRGB(50, 205, 50) or Color3.fromRGB(0, 90, 90)
+    playSound("12221967")
+end)
+
+-- ── Follow Distance ──
+makeStepper(MainFrame, "Follow Distance (st)", 146,
+    function() return followDist end,
+    function() followDist = math.min(200, followDist + 1) end,
+    function() followDist = math.max(1,   followDist - 1) end
+)
+
+-- ── Finger Drag ──
+local FingerDragBtn = makeButton(MainFrame, "Finger Drag: Off", 200, 0.8, 0.1, Color3.fromRGB(0, 60, 140))
+FingerDragBtn.MouseButton1Click:Connect(function()
+    fingerDragOn = not fingerDragOn
+    FingerOverlay.Visible          = fingerDragOn
+    FingerDragBtn.Text             = fingerDragOn and "Finger Drag: On"  or "Finger Drag: Off"
+    FingerDragBtn.BackgroundColor3 = fingerDragOn
+        and Color3.fromRGB(50, 205, 50) or Color3.fromRGB(0, 60, 140)
+    if not fingerDragOn then
+        fingerActive      = false
+        fingerTouchId     = nil
+        FingerDot.Visible = false
+    end
+    playSound("12221967")
+end)
+
+-- ── Yaw ──
+local yawDeg = 0
+makeStepper(MainFrame, "Sword Yaw (deg)", 234,
+    function() return yawDeg end,
+    function() yawDeg = (yawDeg + 15) % 360;       swordYaw = math.rad(yawDeg) end,
+    function() yawDeg = (yawDeg - 15 + 360) % 360; swordYaw = math.rad(yawDeg) end
+)
+
+-- ── Pitch ──
+local pitchDeg = 0
+makeStepper(MainFrame, "Sword Pitch (deg)", 286,
+    function() return pitchDeg end,
+    function() pitchDeg = math.clamp(pitchDeg + 15, -80, 80); swordPitch = math.rad(pitchDeg) end,
+    function() pitchDeg = math.clamp(pitchDeg - 15, -80, 80); swordPitch = math.rad(pitchDeg) end
+)
+
+-- ── Watermark ──
+local Watermark = Instance.new("TextLabel")
+Watermark.Size                   = UDim2.new(1, 0, 0, 16)
+Watermark.Position               = UDim2.new(0, 0, 1, -18)
+Watermark.Text                   = "Devil's Blade — DieStupidNinja by Zeus!"
+Watermark.TextColor3             = Color3.fromRGB(180, 80, 80)
+Watermark.BackgroundTransparency = 1
+Watermark.Font                   = Enum.Font.Fondamento
+Watermark.TextSize               = 11
+Watermark.BorderSizePixel        = 0
+Watermark.Parent                 = MainFrame
+
+-- ── Frame drag ──
+local dragging, dragInput, dragStart, startPos
+MainFrame.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+    or input.UserInputType == Enum.UserInputType.Touch then
+        dragging  = true
+        dragStart = input.Position
+        startPos  = MainFrame.Position
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then dragging = false end
+        end)
+    end
+end)
+MainFrame.InputChanged:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseMovement
+    or input.UserInputType == Enum.UserInputType.Touch then
+        dragInput = input
+    end
+end)
+UserInputService.InputChanged:Connect(function(input)
+    if input == dragInput and dragging then
+        local delta = input.Position - dragStart
+        MainFrame.Position = UDim2.new(
+            startPos.X.Scale, startPos.X.Offset + delta.X,
+            startPos.Y.Scale, startPos.Y.Offset + delta.Y
+        )
+    end
+end)
+
+-- ── Sword rotation joystick ──
+local SwordPad = Instance.new("Frame")
+SwordPad.Size                   = UDim2.new(0, 110, 0, 110)
+SwordPad.Position               = UDim2.new(0, 20, 1, -130)
+SwordPad.BackgroundColor3       = Color3.fromRGB(120, 20, 20)
+SwordPad.BackgroundTransparency = 0.60
+SwordPad.BorderSizePixel        = 0
+SwordPad.Parent                 = ScreenGui
+Instance.new("UICorner", SwordPad).CornerRadius = UDim.new(1, 0)
+
+local SwordKnob = Instance.new("Frame")
+SwordKnob.Size                   = UDim2.new(0, 38, 0, 38)
+SwordKnob.Position               = UDim2.new(0.5, -19, 0.5, -19)
+SwordKnob.BackgroundColor3       = Color3.fromRGB(220, 40, 40)
+SwordKnob.BackgroundTransparency = 0.15
+SwordKnob.BorderSizePixel        = 0
+SwordKnob.Parent                 = SwordPad
+Instance.new("UICorner", SwordKnob).CornerRadius = UDim.new(1, 0)
+
+local SwordJoyLabel = Instance.new("TextLabel")
+SwordJoyLabel.Size                   = UDim2.new(1, 0, 0, 14)
+SwordJoyLabel.Position               = UDim2.new(0, 0, 1, 4)
+SwordJoyLabel.Text                   = "rotate sword"
+SwordJoyLabel.TextColor3             = Color3.fromRGB(255, 160, 160)
+SwordJoyLabel.BackgroundTransparency = 1
+SwordJoyLabel.Font                   = Enum.Font.Fondamento
+SwordJoyLabel.TextSize               = 11
+SwordJoyLabel.Parent                 = SwordPad
+
+local swordJoyActive  = false
+local swordJoyTouchId = nil
+local swordJoyOrigin  = Vector2.new()
+local swordJoyDelta   = Vector2.new()
+local SWORD_JOY_RADIUS   = 45
+local SWORD_ROTATE_SPEED = 0.022
+
+local function clampKnob(delta, maxR)
+    local mag = delta.Magnitude
+    return mag > maxR and (delta / mag * maxR) or delta
+end
+
+SwordPad.InputBegan:Connect(function(input)
+    if (input.UserInputType == Enum.UserInputType.Touch
+    or  input.UserInputType == Enum.UserInputType.MouseButton1)
+    and not swordJoyActive then
+        swordJoyActive  = true
+        swordJoyTouchId = input
+        swordJoyOrigin  = Vector2.new(input.Position.X, input.Position.Y)
+    end
+end)
+UserInputService.InputChanged:Connect(function(input)
+    if swordJoyActive and input == swordJoyTouchId then
+        local delta   = Vector2.new(input.Position.X, input.Position.Y) - swordJoyOrigin
+        local clamped = clampKnob(delta, SWORD_JOY_RADIUS)
+        swordJoyDelta = clamped
+        SwordKnob.Position = UDim2.new(0.5, clamped.X - 19, 0.5, clamped.Y - 19)
+    end
+end)
+UserInputService.InputEnded:Connect(function(input)
+    if input == swordJoyTouchId then
+        swordJoyActive  = false
+        swordJoyTouchId = nil
+        swordJoyDelta   = Vector2.new()
+        SwordKnob.Position = UDim2.new(0.5, -19, 0.5, -19)
+    end
+end)
+RunService.Heartbeat:Connect(function()
+    if not swordJoyActive then return end
+    swordYaw   = swordYaw + swordJoyDelta.X * SWORD_ROTATE_SPEED
+    swordPitch = math.clamp(
+        swordPitch + swordJoyDelta.Y * SWORD_ROTATE_SPEED,
+        -math.pi * 0.88, math.pi * 0.88
+    )
+    yawDeg   = math.floor(math.deg(swordYaw) % 360 + 0.5)
+    pitchDeg = math.floor(math.deg(swordPitch) + 0.5)
+end)
+
+-- ─── Character reload ─────────────────────────────────────────────────────────
+LocalPlayer.CharacterAdded:Connect(function(newChar)
+    character        = newChar
+    humanoidRootPart = newChar:WaitForChild("HumanoidRootPart")
+    humanoid         = newChar:WaitForChild("Humanoid")
+end)
+
+-- ─── Notification ─────────────────────────────────────────────────────────────
+pcall(function()
+    local uid     = Players:GetUserIdFromNameAsync("DieStupidNinja")
+    local content = Players:GetUserThumbnailAsync(uid,
+        Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size420x420)
+    StarterGui:SetCore("SendNotification", {
+        Title    = "Devil's Blade",
+        Text     = "DieStupidNinja — Loaded",
+        Icon     = content,
+        Duration = 5
+    })
+end)
