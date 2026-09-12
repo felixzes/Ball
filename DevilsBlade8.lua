@@ -1,0 +1,1074 @@
+--[[
+    Devil's Blade — 8-Sword Line Formation · Advanced Shape
+    Engine  : Roblox (executor environment)
+    Author  : DieStupidNinja / extended by Zeus
+    Version : 2.0
+
+    Swords  : 8, spaced 4 studs apart starting at 45 studs left of HRP
+    Shape   : 500-point anatomical silhouette (pommel → tip)
+    Controls: In-game GUI — count 1-8, per-sword yaw/pitch, global yaw/pitch,
+              joystick drag, snap-to-position, finger drag (Y-locked)
+
+    Build   : Paste into your executor and run in-game.
+    Notes   : Requires sethiddenproperty, getgenv.
+              Parts are physics-retained via Network bypass.
+              No humanoids are targeted — world BaseParts only.
+]]
+
+-- ─── Services ─────────────────────────────────────────────────────────────────
+local Players          = game:GetService("Players")
+local RunService       = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local SoundService     = game:GetService("SoundService")
+local StarterGui       = game:GetService("StarterGui")
+local Workspace        = game:GetService("Workspace")
+local LocalPlayer      = Players.LocalPlayer
+
+local character        = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+local humanoidRootPart = character:WaitForChild("HumanoidRootPart")
+local humanoid         = character:WaitForChild("Humanoid")
+
+-- ─── Network bypass ───────────────────────────────────────────────────────────
+if not getgenv().Network then
+    getgenv().Network = {
+        BaseParts = {},
+        Velocity  = Vector3.new(14.46, 14.46, 14.46),
+    }
+    local N = getgenv().Network
+    N.RetainPart = function(p)
+        if typeof(p) == "Instance" and p:IsA("BasePart")
+        and p:IsDescendantOf(Workspace) then
+            if not table.find(N.BaseParts, p) then
+                table.insert(N.BaseParts, p)
+                p.CustomPhysicalProperties = PhysicalProperties.new(0,0,0,0,0)
+                p.CanCollide = false
+            end
+        end
+    end
+    LocalPlayer.ReplicationFocus = Workspace
+    RunService.Heartbeat:Connect(function()
+        pcall(function()
+            sethiddenproperty(LocalPlayer, "SimulationRadius",    100000)
+            sethiddenproperty(LocalPlayer, "MaxSimulationRadius", 100000)
+        end)
+        for _, p in pairs(N.BaseParts) do
+            if p:IsDescendantOf(Workspace) and p.Parent then
+                p.Velocity = N.Velocity
+            end
+        end
+    end)
+end
+
+-- ─── Sound helper ─────────────────────────────────────────────────────────────
+local function playSound(id)
+    local s = Instance.new("Sound")
+    s.SoundId = "rbxassetid://" .. id
+    s.Parent  = SoundService
+    s:Play()
+    s.Ended:Connect(function() s:Destroy() end)
+end
+playSound("2865227271")
+
+-- ═════════════════════════════════════════════════════════════════════════════
+--  500-POINT ANATOMICAL TARGET TABLE  (identical shape for every sword)
+--
+--  Sword axis Y: pommel = -60, tip = +60, centred at origin.
+--  X = blade width (cutting edges), Z = blade thickness (spine/bevel).
+--
+--  Sections (local Y):
+--   -60 to -50   Pommel   — outer ring, middle ring, filled disc, pupil
+--   -50 to -42   Grip     — wrapped oval column (5 wrap-ridges)
+--   -42 to -38   Crossguard centre bar
+--   -38 to -22   Guard    — left/right quillon arcs, inner fangs, terminal bulges
+--   -22 to -14   Ricasso  — full-width unsharpened shoulder
+--   -14 to  28   Forte    — broad body, slow taper, fuller groove overlay
+--    28 to  44   Center   — mid-blade continuation
+--    44 to  54   Foible   — narrowing upper third
+--    44 to  56   False edge — secondary bevel cluster (+Z face)
+--    54 to  58   Point    — fast convergence
+--    58 to  60   Tip      — terminal cluster
+-- ═════════════════════════════════════════════════════════════════════════════
+local TARGETS = {}
+local PHI = (1 + math.sqrt(5)) / 2
+
+-- helpers
+local function ring(i, n, r, flatZ)
+    local a = 2 * math.pi * (i - 1) / n
+    return r * math.cos(a), r * math.sin(a) * (flatZ or 1)
+end
+local function sunflower(i, n, R, flatZ)
+    local r = R * math.sqrt(i / n)
+    local a = 2 * math.pi * i / (PHI * PHI)
+    return r * math.cos(a), r * math.sin(a) * (flatZ or 1)
+end
+local function bez3(t, p0, p1, p2, p3)
+    local u = 1 - t
+    return u^3*p0 + 3*u^2*t*p1 + 3*u*t^2*p2 + t^3*p3
+end
+local function jit(i, salt)
+    return ((i * 1619 + salt * 1013) % 1000) / 500 - 1
+end
+
+-- 1. Pommel outer ring — 24 pts
+for i = 1, 24 do
+    local x, z = ring(i, 24, 10.5, 0.30)
+    table.insert(TARGETS, {x=x, y=-57+(i%4)*0.6, z=z})
+end
+-- 2. Pommel middle ring — 18 pts
+for i = 1, 18 do
+    local x, z = ring(i, 18, 7.0, 0.30)
+    table.insert(TARGETS, {x=x, y=-56+(i%3)*0.7, z=z})
+end
+-- 3. Pommel filled disc — 20 pts
+for i = 1, 20 do
+    local x, z = sunflower(i, 20, 6.2, 0.28)
+    table.insert(TARGETS, {x=x, y=-55.5+(i%4)*0.5, z=z})
+end
+-- 4. Pommel pupil — 8 pts
+for i = 1, 8 do
+    local x, z = sunflower(i, 8, 2.8, 0.18)
+    table.insert(TARGETS, {x=x, y=-55+i*0.1, z=z})
+end
+-- 5. Grip — 32 pts
+for i = 1, 32 do
+    local lt = (i-1)/31
+    local y  = -50 + lt*8
+    local r  = 2.4 + math.sin(lt*math.pi*5)*0.9
+    local a  = 2*math.pi*i/PHI
+    table.insert(TARGETS, {x=r*math.cos(a), y=y, z=r*math.sin(a)*0.42})
+end
+-- 6. Crossguard bar — 16 pts
+for i = 1, 16 do
+    local lt = (i-1)/15
+    table.insert(TARGETS, {x=-11+lt*22, y=-40+(i%3)*0.7, z=jit(i,1)*1.6})
+end
+-- 7. Left quillon — 22 pts
+for i = 1, 22 do
+    local t = (i-1)/21
+    local thick = (1-t)*3.8+0.5
+    table.insert(TARGETS, {
+        x = bez3(t,-11,-20,-25,-24) + jit(i,3)*thick*0.4,
+        y = bez3(t,-40,-39,-37,-34),
+        z = jit(i,2)*thick*0.5
+    })
+end
+-- 8. Right quillon — 22 pts
+for i = 1, 22 do
+    local t = (i-1)/21
+    local thick = (1-t)*3.8+0.5
+    table.insert(TARGETS, {
+        x = bez3(t,11,20,25,24) + jit(i,5)*thick*0.4,
+        y = bez3(t,-40,-39,-37,-34),
+        z = jit(i,4)*thick*0.5
+    })
+end
+-- 9. Left guard bulge — 8 pts
+for i = 1, 8 do
+    local a = 2*math.pi*(i-1)/8
+    table.insert(TARGETS, {x=-24+math.cos(a)*2.8, y=-34+math.sin(a)*2.2, z=jit(i,6)*0.9})
+end
+-- 10. Right guard bulge — 8 pts
+for i = 1, 8 do
+    local a = 2*math.pi*(i-1)/8
+    table.insert(TARGETS, {x=24+math.cos(a)*2.8, y=-34+math.sin(a)*2.2, z=jit(i,7)*0.9})
+end
+-- 11. Left inner fang — 10 pts
+for i = 1, 10 do
+    local lt = (i-1)/9
+    local thick = (1-lt)*2.8+0.3
+    table.insert(TARGETS, {
+        x = bez3(lt,-9,-14,-16,-13),
+        y = bez3(lt,-40,-43,-47,-49),
+        z = jit(i,8)*thick*0.4
+    })
+end
+-- 12. Right inner fang — 10 pts
+for i = 1, 10 do
+    local lt = (i-1)/9
+    local thick = (1-lt)*2.8+0.3
+    table.insert(TARGETS, {
+        x = bez3(lt,9,14,16,13),
+        y = bez3(lt,-40,-43,-47,-49),
+        z = jit(i,9)*thick*0.4
+    })
+end
+-- 13. Langets — 8 pts
+for i = 1, 4 do table.insert(TARGETS, {x=-3.6, y=-38-(i-1)/3*6, z=jit(i,10)*0.3}) end
+for i = 1, 4 do table.insert(TARGETS, {x= 3.6, y=-38-(i-1)/3*6, z=jit(i,11)*0.3}) end
+
+-- Blade profile (half-width, half-depth) at local Y
+local BLADE_ROOT_Y = -14
+local BLADE_TIP_Y  =  60
+local BLADE_MAX_HW =  13.5
+local BLADE_MAX_HD =   2.2
+local function bladeProfile(y)
+    if y <= BLADE_ROOT_Y then return BLADE_MAX_HW, BLADE_MAX_HD end
+    if y >= BLADE_TIP_Y  then return 0, 0 end
+    local bodyEnd = 54
+    if y <= bodyEnd then
+        local t = (y - BLADE_ROOT_Y) / (bodyEnd - BLADE_ROOT_Y)
+        return math.max(0, BLADE_MAX_HW*(1-t^1.6)),
+               math.max(0, BLADE_MAX_HD*(1-t^1.3))
+    end
+    local t = (y - bodyEnd) / (BLADE_TIP_Y - bodyEnd)
+    return BLADE_MAX_HW*(1-t)*0.08, BLADE_MAX_HD*(1-t)*0.18
+end
+
+-- 14. Ricasso — 16 pts
+for i = 1, 16 do
+    local lt=(i-1)/15; local y=-22+lt*8; local hw,hd=bladeProfile(y)
+    local a=2*math.pi*i/PHI; local r=math.sqrt((i-0.5)/16)
+    table.insert(TARGETS, {x=r*hw*math.cos(a), y=y, z=r*hd*math.sin(a)})
+end
+-- 15. Shoulder — 8 pts
+for i = 1, 8 do
+    local a=2*math.pi*(i-1)/8; local hw,hd=bladeProfile(-14)
+    table.insert(TARGETS, {x=hw*math.cos(a), y=-14+(i%3)*0.4, z=hd*math.sin(a)})
+end
+-- 16. Forte — 64 pts
+for i = 1, 64 do
+    local lt=(i-1)/63; local y=-14+lt*42; local hw,hd=bladeProfile(y)
+    local m=i%10; local x,z
+    if m<4 then
+        local s=(i%2==0)and 1 or -1
+        x=s*(hw*0.93+jit(i,12)*0.9); z=jit(i,13)*hd*0.45
+    elseif m<7 then
+        x=jit(i,14)*hw*0.80; z=(i%2==0 and 1 or -1)*(hd*0.88+jit(i,15)*0.15)
+    elseif m<9 then
+        local a=2*math.pi*i/PHI; local r=math.sqrt(((i-1)%16+0.5)/16)
+        x=r*hw*math.cos(a); z=r*hd*math.sin(a)
+    else
+        x=jit(i,16)*hw*0.18; z=jit(i,17)*0.20
+    end
+    table.insert(TARGETS, {x=x, y=y, z=z})
+end
+-- 17. Fuller groove — 14 pts
+for i = 1, 14 do
+    local lt=(i-1)/13; local y=-14+lt*46; local hw,_=bladeProfile(y)
+    table.insert(TARGETS, {x=jit(i,18)*hw*0.20, y=y, z=jit(i,19)*0.18})
+end
+-- 18. Center — 40 pts
+for i = 1, 40 do
+    local lt=(i-1)/39; local y=28+lt*16; local hw,hd=bladeProfile(y)
+    local m=i%8; local x,z
+    if m<3 then
+        local s=(i%2==0)and 1 or -1
+        x=s*(hw*0.92+jit(i,20)*0.6); z=jit(i,21)*hd*0.4
+    elseif m<6 then
+        x=jit(i,22)*hw*0.75; z=(i%2==0 and 1 or -1)*(hd*0.85+jit(i,23)*0.12)
+    else
+        local a=2*math.pi*i/PHI; local r=math.sqrt(((i-1)%12+0.5)/12)
+        x=r*hw*math.cos(a); z=r*hd*math.sin(a)
+    end
+    table.insert(TARGETS, {x=x, y=y, z=z})
+end
+-- 19. Foible — 32 pts
+for i = 1, 32 do
+    local lt=(i-1)/31; local y=44+lt*10; local hw,hd=bladeProfile(y)
+    hw=math.max(hw,0.05)
+    local m=i%6; local x,z
+    if m<2 then
+        local s=(i%2==0)and 1 or -1
+        x=s*(hw*0.94+jit(i,24)*0.4); z=jit(i,25)*hd*0.35
+    elseif m<4 then
+        x=jit(i,26)*hw*0.70; z=(i%2==0 and 1 or -1)*(hd*0.82+jit(i,27)*0.10)
+    else
+        local a=2*math.pi*i/PHI; local r=math.sqrt(((i-1)%8+0.5)/8)
+        x=r*hw*math.cos(a); z=r*hd*math.sin(a)
+    end
+    table.insert(TARGETS, {x=x, y=y, z=z})
+end
+-- 20. False edge — 14 pts
+for i = 1, 14 do
+    local lt=(i-1)/13; local y=44+lt*12; local hw,hd=bladeProfile(y)
+    table.insert(TARGETS, {x=jit(i,28)*hw*0.55, y=y, z=hd*0.70+jit(i,29)*hd*0.25})
+end
+-- 21. Point — 16 pts
+for i = 1, 16 do
+    local lt=(i-1)/15; local y=54+lt*4; local hw,hd=bladeProfile(y)
+    hw=math.max(hw,0.03)
+    local a=2*math.pi*i/PHI; local r=math.sqrt((i-0.5)/16)
+    table.insert(TARGETS, {x=r*hw*math.cos(a), y=y, z=r*hd*math.sin(a)})
+end
+-- 22. Terminal tip — 8 pts
+for i = 1, 8 do
+    local lt=(i-1)/7; local y=58+lt*2; local hw=0.5*(1-lt)
+    local a=2*math.pi*i/PHI
+    table.insert(TARGETS, {x=hw*math.cos(a), y=y, z=hw*math.sin(a)*0.15})
+end
+
+-- pad/trim to exactly 500
+while #TARGETS < 500 do table.insert(TARGETS, {x=0,y=60,z=0}) end
+if #TARGETS > 500 then for i = #TARGETS, 501, -1 do TARGETS[i] = nil end end
+
+local function getSlot(i) return TARGETS[((i-1)%500)+1] end
+
+-- ═════════════════════════════════════════════════════════════════════════════
+--  SWORD SYSTEM
+-- ═════════════════════════════════════════════════════════════════════════════
+local SWORD_COUNT      = 8
+local BASE_LEFT_STUDS  = 45   -- studs left of HRP for sword 1
+local SWORD_SPACING    = 4    -- studs between consecutive swords
+
+local partOwner        = {}
+local partCounter      = 0
+local activeSwordCount = 0
+local swords           = {}
+
+local function createSword(slotIndex)
+    local sw            = {}
+    sw.slotIndex        = slotIndex
+    sw.enabled          = false
+    sw.fingerActive     = false
+    sw.fingerTouch      = nil
+    sw.yaw              = 0
+    sw.pitch            = 0
+    sw.parts            = {}
+    sw.centerPos        = humanoidRootPart.Position
+
+    sw.folder           = Instance.new("Folder", Workspace)
+    sw.anchor           = Instance.new("Part", sw.folder)
+    sw.anchor.Anchored      = true
+    sw.anchor.CanCollide    = false
+    sw.anchor.Transparency  = 1
+    sw.anchor.Size          = Vector3.new(1,1,1)
+    sw.anchor.Position      = humanoidRootPart.Position
+
+    local TAG_A = "SW"..slotIndex.."_Att"
+    local TAG_P = "SW"..slotIndex.."_AP"
+    local TAG_T = "SW"..slotIndex.."_Torq"
+
+    sw.getFollowPos = function()
+        if not humanoidRootPart then return sw.centerPos end
+        local cf   = humanoidRootPart.CFrame
+        local left = -cf.RightVector
+        local dist = BASE_LEFT_STUDS + (slotIndex - 1) * SWORD_SPACING
+        return cf.Position + left * dist
+    end
+
+    sw.isEligible = function(p)
+        if not p:IsA("BasePart") then return false end
+        if p.Anchored then return false end
+        if not p:IsDescendantOf(Workspace) then return false end
+        for _, osw in ipairs(swords) do
+            if p:IsDescendantOf(osw.folder) then return false end
+        end
+        if LocalPlayer.Character and p:IsDescendantOf(LocalPlayer.Character) then return false end
+        local a = p.Parent
+        while a and a ~= Workspace do
+            if a:FindFirstChild("Humanoid") or a:FindFirstChild("Head") then return false end
+            a = a.Parent
+        end
+        return true
+    end
+
+    sw.forcePart = function(p)
+        for _, x in next, p:GetChildren() do
+            if x:IsA("BodyAngularVelocity") or x:IsA("BodyForce") or x:IsA("BodyGyro")
+            or x:IsA("BodyPosition")        or x:IsA("BodyThrust") or x:IsA("BodyVelocity")
+            or x:IsA("RocketPropulsion") then x:Destroy() end
+        end
+        if p:FindFirstChild(TAG_A) then p:FindFirstChild(TAG_A):Destroy() end
+        if p:FindFirstChild(TAG_P) then p:FindFirstChild(TAG_P):Destroy() end
+        if p:FindFirstChild(TAG_T) then p:FindFirstChild(TAG_T):Destroy() end
+        p.CanCollide = false
+        local att  = Instance.new("Attachment", p);  att.Name  = TAG_A
+        local torq = Instance.new("Torque", p);      torq.Name = TAG_T
+        torq.Torque = Vector3.new(1e5,1e5,1e5); torq.Attachment0 = att
+        local na   = Instance.new("Attachment", sw.anchor)
+        local ap   = Instance.new("AlignPosition", p); ap.Name = TAG_P
+        ap.MaxForce     = math.huge
+        ap.MaxVelocity  = math.huge
+        ap.Responsiveness = 1000
+        ap.Attachment0  = att
+        ap.Attachment1  = na
+        ap.Parent       = p
+    end
+
+    sw.cleanPart = function(p)
+        if not p or not p.Parent then return end
+        if p:FindFirstChild(TAG_A) then p:FindFirstChild(TAG_A):Destroy() end
+        if p:FindFirstChild(TAG_P) then p:FindFirstChild(TAG_P):Destroy() end
+        if p:FindFirstChild(TAG_T) then p:FindFirstChild(TAG_T):Destroy() end
+    end
+
+    sw.addPart = function(p)
+        if not sw.enabled then return end
+        if not sw.isEligible(p) then return end
+        if table.find(sw.parts, p) then return end
+        local owner = partOwner[p]
+        if owner == nil then
+            if activeSwordCount == 0 then return end
+            partCounter = partCounter + 1
+            local assigned = ((partCounter - 1) % activeSwordCount) + 1
+            partOwner[p] = assigned; owner = assigned
+        end
+        if owner ~= slotIndex then return end
+        if getgenv().Network then getgenv().Network.RetainPart(p) end
+        sw.forcePart(p); table.insert(sw.parts, p)
+    end
+
+    sw.removePart = function(p)
+        local idx = table.find(sw.parts, p)
+        if idx then table.remove(sw.parts, idx) end
+        if partOwner[p] == slotIndex then partOwner[p] = nil end
+    end
+
+    sw.rot = function(x, y, z)
+        local cy, sy = math.cos(sw.yaw),   math.sin(sw.yaw)
+        local cp, sp = math.cos(sw.pitch),  math.sin(sw.pitch)
+        local rx = cy*x - sy*z
+        local rz = sy*x + cy*z
+        return rx, cp*y - sp*rz, sp*y + cp*rz
+    end
+
+    return sw
+end
+
+for i = 1, SWORD_COUNT do
+    table.insert(swords, createSword(i))
+end
+
+-- ─── Partition reset ──────────────────────────────────────────────────────────
+local function resetPartitions()
+    for _, sw in ipairs(swords) do
+        for _, p in ipairs(sw.parts) do sw.cleanPart(p) end
+        sw.parts = {}
+        for _, ch in ipairs(sw.anchor:GetChildren()) do
+            if ch:IsA("Attachment") then ch:Destroy() end
+        end
+    end
+    partOwner = {}; partCounter = 0
+    if activeSwordCount == 0 then return end
+
+    local pool = {}
+    for _, p in ipairs(Workspace:GetDescendants()) do
+        if p:IsA("BasePart") and not p.Anchored then
+            local skip = false
+            for _, sw in ipairs(swords) do
+                if p:IsDescendantOf(sw.folder) then skip = true; break end
+            end
+            if not skip and LocalPlayer.Character
+            and p:IsDescendantOf(LocalPlayer.Character) then skip = true end
+            if not skip then
+                local a = p.Parent
+                while a and a ~= Workspace do
+                    if a:FindFirstChild("Humanoid") or a:FindFirstChild("Head") then
+                        skip = true; break
+                    end
+                    a = a.Parent
+                end
+            end
+            if not skip then table.insert(pool, p) end
+        end
+    end
+
+    for i, p in ipairs(pool) do
+        local assigned = ((i-1) % activeSwordCount) + 1
+        partOwner[p] = assigned; partCounter = i
+        local sw = swords[assigned]
+        if sw.enabled then
+            if getgenv().Network then getgenv().Network.RetainPart(p) end
+            sw.forcePart(p); table.insert(sw.parts, p)
+        end
+    end
+end
+
+-- ─── Global part wiring ───────────────────────────────────────────────────────
+local function globalAdd(p)
+    if activeSwordCount == 0 then return end
+    if not p:IsA("BasePart") or p.Anchored then return end
+    if not p:IsDescendantOf(Workspace) then return end
+    for _, sw in ipairs(swords) do
+        if p:IsDescendantOf(sw.folder) then return end
+    end
+    if LocalPlayer.Character and p:IsDescendantOf(LocalPlayer.Character) then return end
+    local a = p.Parent
+    while a and a ~= Workspace do
+        if a:FindFirstChild("Humanoid") or a:FindFirstChild("Head") then return end
+        a = a.Parent
+    end
+    if partOwner[p] then
+        local sw = swords[partOwner[p]]
+        if sw and sw.enabled and not table.find(sw.parts, p) then
+            sw.forcePart(p); table.insert(sw.parts, p)
+        end
+        return
+    end
+    partCounter = partCounter + 1
+    local assigned = ((partCounter - 1) % activeSwordCount) + 1
+    partOwner[p] = assigned
+    local sw = swords[assigned]
+    if sw and sw.enabled then
+        if getgenv().Network then getgenv().Network.RetainPart(p) end
+        sw.forcePart(p); table.insert(sw.parts, p)
+    end
+end
+
+local function globalRemove(p)
+    for _, sw in ipairs(swords) do
+        local idx = table.find(sw.parts, p)
+        if idx then table.remove(sw.parts, idx) end
+    end
+    partOwner[p] = nil
+end
+
+Workspace.DescendantAdded:Connect(globalAdd)
+Workspace.DescendantRemoving:Connect(globalRemove)
+
+RunService.Stepped:Connect(function()
+    for _, p in ipairs(Workspace:GetDescendants()) do
+        if p:IsA("BasePart") and not p.Anchored and not partOwner[p] then
+            globalAdd(p)
+        end
+    end
+end)
+
+-- ─── Shape engine — moves parts toward their target slot each Heartbeat ───────
+RunService.Heartbeat:Connect(function()
+    for _, sw in ipairs(swords) do
+        if sw.enabled then
+            for i, part in ipairs(sw.parts) do
+                if part.Parent and not part.Anchored then
+                    local s  = getSlot(i)
+                    local rx, ry, rz = sw.rot(s.x, s.y, s.z)
+                    local target = sw.centerPos + Vector3.new(rx, ry, rz)
+                    local dir    = target - part.Position
+                    if dir.Magnitude > 0 then
+                        part.Velocity = dir.Unit * 999999
+                    end
+                end
+            end
+        end
+    end
+end)
+
+-- ─── Follow engine — tracks player when no finger is dragging ────────────────
+RunService.Heartbeat:Connect(function()
+    for _, sw in ipairs(swords) do
+        if sw.enabled and not sw.fingerActive then
+            sw.centerPos     = sw.getFollowPos()
+            sw.anchor.Position = sw.centerPos
+        end
+    end
+end)
+
+-- ─── Y-locked screen-to-world resolver ───────────────────────────────────────
+local function screenToWorld(sp, planeY)
+    local cam = Workspace.CurrentCamera
+    if not cam then return nil end
+    local ray = cam:ScreenPointToRay(sp.X, sp.Y)
+    local d   = ray.Direction
+    if math.abs(d.Y) < 0.0001 then return ray.Origin + d * 200 end
+    local t = (planeY - ray.Origin.Y) / d.Y
+    if t <= 0 then return ray.Origin + d * 200 end
+    return ray.Origin + d * t
+end
+
+-- ═════════════════════════════════════════════════════════════════════════════
+--  GUI
+-- ═════════════════════════════════════════════════════════════════════════════
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name           = "DevilsBladeGUI_8"
+ScreenGui.ResetOnSpawn   = false
+ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+ScreenGui.Parent         = LocalPlayer:WaitForChild("PlayerGui")
+
+-- Shared overlay for finger drag
+local sharedOverlay = Instance.new("Frame")
+sharedOverlay.Size                  = UDim2.new(1,0,1,0)
+sharedOverlay.BackgroundTransparency = 1
+sharedOverlay.BorderSizePixel       = 0
+sharedOverlay.ZIndex                = 0
+sharedOverlay.Parent                = ScreenGui
+
+-- Finger indicator dots (8)
+local fingerDots  = {}
+local dotColors   = {
+    Color3.fromRGB(176, 18, 34),  Color3.fromRGB(18, 105, 176),
+    Color3.fromRGB(15, 138, 68),  Color3.fromRGB(168, 112, 16),
+    Color3.fromRGB(136, 48, 192), Color3.fromRGB(192, 112, 16),
+    Color3.fromRGB(16, 136, 136), Color3.fromRGB(192, 64, 128),
+}
+for i = 1, SWORD_COUNT do
+    local fd = Instance.new("Frame")
+    fd.Size                  = UDim2.new(0,24,0,24)
+    fd.AnchorPoint           = Vector2.new(0.5,0.5)
+    fd.BackgroundColor3      = dotColors[i]
+    fd.BackgroundTransparency = 0.15
+    fd.BorderSizePixel       = 0
+    fd.Visible               = false
+    fd.ZIndex                = 10
+    fd.Parent                = ScreenGui
+    Instance.new("UICorner", fd).CornerRadius = UDim.new(1, 0)
+    fingerDots[i] = fd
+end
+
+local touchToSword = {}
+local swordDragY   = {}
+
+sharedOverlay.InputBegan:Connect(function(inp)
+    if inp.UserInputType ~= Enum.UserInputType.Touch
+    and inp.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
+    for i, sw in ipairs(swords) do
+        if sw.enabled and not sw.fingerActive then
+            sw.fingerActive = true; sw.fingerTouch = inp
+            touchToSword[inp] = i; swordDragY[i] = sw.centerPos.Y
+            local wp = screenToWorld(Vector2.new(inp.Position.X, inp.Position.Y), swordDragY[i])
+            if wp then
+                local locked = Vector3.new(wp.X, swordDragY[i], wp.Z)
+                sw.centerPos = locked; sw.anchor.Position = locked
+                fingerDots[i].Position = UDim2.new(0, inp.Position.X, 0, inp.Position.Y)
+                fingerDots[i].Visible  = true
+            end
+            break
+        end
+    end
+end)
+
+UserInputService.InputChanged:Connect(function(inp)
+    local i = touchToSword[inp]; if not i then return end
+    local sw = swords[i]; if not sw or not sw.fingerActive then return end
+    if inp.UserInputType ~= Enum.UserInputType.Touch
+    and inp.UserInputType ~= Enum.UserInputType.MouseMovement then return end
+    local lockedY = swordDragY[i] or sw.centerPos.Y
+    local wp = screenToWorld(Vector2.new(inp.Position.X, inp.Position.Y), lockedY)
+    if wp then
+        local locked = Vector3.new(wp.X, lockedY, wp.Z)
+        sw.centerPos = locked; sw.anchor.Position = locked
+        fingerDots[i].Position = UDim2.new(0, inp.Position.X, 0, inp.Position.Y)
+        fingerDots[i].Visible  = true
+    end
+end)
+
+UserInputService.InputEnded:Connect(function(inp)
+    local i = touchToSword[inp]; if not i then return end
+    local sw = swords[i]
+    if sw then
+        sw.fingerActive = false; sw.fingerTouch = nil; swordDragY[i] = nil
+        sw.centerPos = sw.getFollowPos(); sw.anchor.Position = sw.centerPos
+        fingerDots[i].Visible = false
+    end
+    touchToSword[inp] = nil
+end)
+
+-- ─── UI helpers ───────────────────────────────────────────────────────────────
+local C = Color3.fromRGB
+local function frame(parent, size, pos, bg, bgT, z, r)
+    local f = Instance.new("Frame")
+    f.Size                   = size
+    f.Position               = pos or UDim2.new(0,0,0,0)
+    f.BackgroundColor3       = bg or C(18,4,4)
+    f.BackgroundTransparency = bgT or 0
+    f.BorderSizePixel        = 0
+    f.ZIndex                 = z or 5
+    f.Parent                 = parent
+    if r then Instance.new("UICorner", f).CornerRadius = UDim.new(0, r) end
+    return f
+end
+local function lbl(parent, text, pos, size, fs, fc, font, align, z)
+    local L = Instance.new("TextLabel")
+    L.Size               = size or UDim2.new(1,0,0,18)
+    L.Position           = pos  or UDim2.new(0,0,0,0)
+    L.Text               = text
+    L.TextColor3         = fc   or C(255,180,180)
+    L.BackgroundTransparency = 1
+    L.Font               = font or Enum.Font.Fondamento
+    L.TextSize           = fs   or 11
+    L.TextXAlignment     = align or Enum.TextXAlignment.Left
+    L.BorderSizePixel    = 0
+    L.ZIndex             = z or 7
+    L.Parent             = parent
+    return L
+end
+local function btn(parent, text, pos, size, bg, tc, fs, r)
+    local B = Instance.new("TextButton")
+    B.Size               = size or UDim2.new(0.8,0,0,26)
+    B.Position           = pos  or UDim2.new(0.1,0,0,0)
+    B.Text               = text
+    B.BackgroundColor3   = bg or C(140,0,0)
+    B.TextColor3         = tc or C(255,255,255)
+    B.Font               = Enum.Font.Fondamento
+    B.TextSize           = fs or 13
+    B.BorderSizePixel    = 0
+    B.ZIndex             = 8
+    B.Parent             = parent
+    Instance.new("UICorner", B).CornerRadius = UDim.new(0, r or 8)
+    return B
+end
+local function stepper(parent, labelTxt, yOff, getV, onInc, onDec)
+    lbl(parent, labelTxt, UDim2.new(0,4,0,yOff), UDim2.new(1,-8,0,14), 11)
+    local d = btn(parent, "-", UDim2.new(0.04,0,0,yOff+14), UDim2.new(0.2,0,0,24),
+                  C(100,20,0), C(255,220,220), 13)
+    local disp = Instance.new("TextLabel")
+    disp.Size                = UDim2.new(0.38,0,0,24)
+    disp.Position            = UDim2.new(0.28,0,0,yOff+14)
+    disp.Text                = tostring(getV())
+    disp.BackgroundColor3    = C(30,6,6)
+    disp.TextColor3          = C(255,200,200)
+    disp.Font                = Enum.Font.Fondamento
+    disp.TextSize            = 12
+    disp.BorderSizePixel     = 0
+    disp.ZIndex              = 7
+    disp.Parent              = parent
+    Instance.new("UICorner", disp).CornerRadius = UDim.new(0,6)
+    local u = btn(parent, "+", UDim2.new(0.70,0,0,yOff+14), UDim2.new(0.2,0,0,24),
+                  C(140,20,0), C(255,220,220), 13)
+    d.MouseButton1Click:Connect(function() onDec(); disp.Text = tostring(getV()) end)
+    u.MouseButton1Click:Connect(function() onInc(); disp.Text = tostring(getV()) end)
+    return disp
+end
+
+-- ─── Main panel dimensions ────────────────────────────────────────────────────
+-- Left sidebar: summon count, global rotation, network info
+-- Right: 2×4 grid of sword cards (8 swords)
+local SIDEBAR_W  = 220
+local CARD_W     = 230
+local CARD_H     = 82
+local CARD_GAP   = 6
+local GRID_COLS  = 2
+local GRID_W     = CARD_W * GRID_COLS + CARD_GAP * (GRID_COLS + 1)
+local PANEL_W    = SIDEBAR_W + GRID_W + 12
+local PANEL_H    = math.max(
+    480,
+    CARD_GAP + math.ceil(SWORD_COUNT / GRID_COLS) * (CARD_H + CARD_GAP) + 60
+)
+
+local MainFrame = frame(ScreenGui,
+    UDim2.new(0, PANEL_W, 0, PANEL_H),
+    UDim2.new(0.5, -PANEL_W//2, 0.5, -PANEL_H//2),
+    C(14, 3, 5), 0, 5, 16)
+MainFrame.ClipsDescendants = true
+
+-- title bar
+local TitleBar = frame(MainFrame,
+    UDim2.new(1,0,0,34), UDim2.new(0,0,0,0),
+    C(90,0,0), 0, 6, 0)
+TitleBar.ClipsDescendants = false
+Instance.new("UICorner", TitleBar).CornerRadius = UDim.new(0,16)
+lbl(TitleBar, "⚔  Devil's Blade — 8-Sword Formation",
+    UDim2.new(0,36,0,0), UDim2.new(1,-60,1,0), 13,
+    C(255,100,100), Enum.Font.Fondamento, Enum.TextXAlignment.Left, 7)
+
+-- panel drag
+local panelDragging = false; local panelTouchId = nil
+local panelDragStart = Vector2.new(); local panelStartPos = MainFrame.Position
+TitleBar.InputBegan:Connect(function(inp)
+    if inp.UserInputType ~= Enum.UserInputType.MouseButton1
+    and inp.UserInputType ~= Enum.UserInputType.Touch then return end
+    if panelDragging then return end
+    panelDragging = true; panelTouchId = inp
+    panelDragStart = Vector2.new(inp.Position.X, inp.Position.Y)
+    panelStartPos  = MainFrame.Position
+end)
+UserInputService.InputChanged:Connect(function(inp)
+    if not panelDragging or inp ~= panelTouchId then return end
+    if inp.UserInputType ~= Enum.UserInputType.Touch
+    and inp.UserInputType ~= Enum.UserInputType.MouseMovement then return end
+    local dx = inp.Position.X - panelDragStart.X
+    local dy = inp.Position.Y - panelDragStart.Y
+    MainFrame.Position = UDim2.new(
+        panelStartPos.X.Scale, panelStartPos.X.Offset + dx,
+        panelStartPos.Y.Scale, panelStartPos.Y.Offset + dy)
+end)
+UserInputService.InputEnded:Connect(function(inp)
+    if inp == panelTouchId then panelDragging = false; panelTouchId = nil end
+end)
+
+-- minimise
+local minimized = false
+local minBtn = btn(MainFrame, "−",
+    UDim2.new(1,-30,0,4), UDim2.new(0,24,0,24),
+    C(120,0,0), C(255,255,255), 14, 8)
+minBtn.ZIndex = 10
+minBtn.MouseButton1Click:Connect(function()
+    minimized = not minimized
+    for _, c in ipairs(MainFrame:GetChildren()) do
+        if c ~= minBtn and c.Name ~= "UICorner" and c:IsA("GuiObject") then
+            c.Visible = not minimized
+        end
+    end
+    minBtn.Text    = minimized and "+" or "−"
+    minBtn.Visible = true
+    MainFrame.Size = minimized
+        and UDim2.new(0, PANEL_W, 0, 38)
+        or  UDim2.new(0, PANEL_W, 0, PANEL_H)
+end)
+
+-- ─── Left sidebar ─────────────────────────────────────────────────────────────
+local Sidebar = frame(MainFrame,
+    UDim2.new(0, SIDEBAR_W, 1, -38),
+    UDim2.new(0, 0, 0, 38),
+    C(18, 4, 6), 0, 6)
+
+-- Summon count 1-8
+lbl(Sidebar, "SUMMON COUNT", UDim2.new(0,6,0,6), UDim2.new(1,-12,0,14),
+    10, C(255,120,120))
+local countBtns = {}
+local btnCols = {
+    C(160,0,0),   C(0,90,160),  C(0,130,60),  C(160,80,0),
+    C(100,30,160), C(160,90,0), C(0,100,100), C(160,40,100),
+}
+-- 2-row × 4-col layout
+for i = 1, 8 do
+    local col = (i-1) % 4
+    local row = math.floor((i-1) / 4)
+    local b = btn(Sidebar, tostring(i),
+        UDim2.new(col*0.25, 2, 0, 24 + row*30),
+        UDim2.new(0.23, 0, 0, 26),
+        C(50,50,50), C(255,255,255), 13, 7)
+    countBtns[i] = b
+end
+
+-- Info strip
+local infoLbl = lbl(Sidebar, "45st left · drag · Y-locked · release snaps",
+    UDim2.new(0.02,0,0,90), UDim2.new(0.96,0,0,20),
+    9, C(180,120,130), Enum.Font.Fondamento, Enum.TextXAlignment.Center, 7)
+local infoF = frame(Sidebar, UDim2.new(0.96,0,0,20), UDim2.new(0.02,0,0,90),
+    C(30,6,8), 0, 6, 6)
+infoLbl.Parent = infoF; infoLbl.Position = UDim2.new(0,0,0,0)
+infoLbl.Size   = UDim2.new(1,0,1,0); infoF.Parent = Sidebar
+
+-- Global yaw / pitch
+lbl(Sidebar, "── ALL SWORDS ──", UDim2.new(0,6,0,118), UDim2.new(1,-12,0,14),
+    10, C(200,100,100))
+local allYawDeg   = 0
+local allPitchDeg = 0
+stepper(Sidebar, "All Yaw (deg)", 134,
+    function() return allYawDeg end,
+    function()
+        allYawDeg = (allYawDeg+15)%360
+        for _, sw in ipairs(swords) do if sw.enabled then sw.yaw = math.rad(allYawDeg) end end
+    end,
+    function()
+        allYawDeg = (allYawDeg-15+360)%360
+        for _, sw in ipairs(swords) do if sw.enabled then sw.yaw = math.rad(allYawDeg) end end
+    end)
+stepper(Sidebar, "All Pitch (deg)", 182,
+    function() return allPitchDeg end,
+    function()
+        allPitchDeg = math.clamp(allPitchDeg+15,-80,80)
+        for _, sw in ipairs(swords) do if sw.enabled then sw.pitch = math.rad(allPitchDeg) end end
+    end,
+    function()
+        allPitchDeg = math.clamp(allPitchDeg-15,-80,80)
+        for _, sw in ipairs(swords) do if sw.enabled then sw.pitch = math.rad(allPitchDeg) end end
+    end)
+
+-- Network badge
+lbl(Sidebar, "NETWORK", UDim2.new(0,6,0,240), UDim2.new(1,-12,0,14), 10, C(200,100,100))
+local netBadge = frame(Sidebar, UDim2.new(0.9,0,0,20), UDim2.new(0.05,0,0,256),
+    C(0,30,70), 0.4, 7, 5)
+lbl(netBadge, "● Retained · SimRadius 100 000",
+    UDim2.new(0,0,0,0), UDim2.new(1,0,1,0), 9, C(80,160,255),
+    Enum.Font.Fondamento, Enum.TextXAlignment.Center, 8)
+
+-- Watermark
+lbl(Sidebar, "Devil's Blade Advanced — DieStupidNinja",
+    UDim2.new(0,0,1,-18), UDim2.new(1,0,0,16),
+    9, C(140,60,70), Enum.Font.Fondamento, Enum.TextXAlignment.Center, 7)
+
+-- Joystick
+lbl(Sidebar, "ROTATE ALL (DRAG)", UDim2.new(0,6,0,282), UDim2.new(1,-12,0,14),
+    10, C(200,100,100))
+local JoyPanel = frame(Sidebar,
+    UDim2.new(0, 110, 0, 110),
+    UDim2.new(0.5, -55, 0, 298),
+    C(25,8,10), 0.55, 7, 55)
+local JoyKnob = frame(JoyPanel,
+    UDim2.new(0,36,0,36),
+    UDim2.new(0.5,-18,0.5,-18),
+    C(200,20,30), 0, 8, 18)
+
+local sjActive  = false; local sjTouch = nil
+local sjOrigin  = Vector2.new(); local sjDelta = Vector2.new()
+local function clamp2d(v, m) local mg = v.Magnitude; return mg > m and v/mg*m or v end
+
+JoyPanel.InputBegan:Connect(function(inp)
+    if (inp.UserInputType == Enum.UserInputType.Touch
+    or  inp.UserInputType == Enum.UserInputType.MouseButton1) and not sjActive then
+        sjActive = true; sjTouch = inp
+        sjOrigin = Vector2.new(inp.Position.X, inp.Position.Y)
+    end
+end)
+UserInputService.InputChanged:Connect(function(inp)
+    if sjActive and inp == sjTouch then
+        local d = Vector2.new(inp.Position.X, inp.Position.Y) - sjOrigin
+        local c = clamp2d(d, 45)
+        sjDelta = c
+        JoyKnob.Position = UDim2.new(0.5, c.X-18, 0.5, c.Y-18)
+    end
+end)
+UserInputService.InputEnded:Connect(function(inp)
+    if inp == sjTouch then
+        sjActive = false; sjTouch = nil; sjDelta = Vector2.new()
+        JoyKnob.Position = UDim2.new(0.5,-18,0.5,-18)
+    end
+end)
+RunService.Heartbeat:Connect(function()
+    if not sjActive then return end
+    for _, sw in ipairs(swords) do
+        if sw.enabled then
+            sw.yaw   = sw.yaw   + sjDelta.X * 0.018
+            sw.pitch = math.clamp(sw.pitch + sjDelta.Y * 0.018, -math.pi*0.88, math.pi*0.88)
+        end
+    end
+    allYawDeg   = math.floor(math.deg(swords[1].yaw)   % 360 + 0.5)
+    allPitchDeg = math.floor(math.deg(swords[1].pitch)  + 0.5)
+end)
+
+-- ─── Sword card grid ──────────────────────────────────────────────────────────
+local SWORD_NAMES = {"Ⅰ","Ⅱ","Ⅲ","Ⅳ","Ⅴ","Ⅵ","Ⅶ","Ⅷ"}
+local SWORD_STUDS = {45,49,53,57,61,65,69,73}
+local SWORD_COLORS = {
+    C(176,18,34),  C(18,105,176),  C(15,138,68),  C(168,112,16),
+    C(136,48,192), C(192,112,16),  C(16,136,136), C(192,64,128),
+}
+local CardGrid = frame(MainFrame,
+    UDim2.new(0, GRID_W, 1, -42),
+    UDim2.new(0, SIDEBAR_W+4, 0, 40),
+    C(12,2,4), 0, 6)
+
+local cardYawDisplays   = {}
+local cardPitchDisplays = {}
+
+for i = 1, SWORD_COUNT do
+    local col   = (i-1) % GRID_COLS
+    local row   = math.floor((i-1) / GRID_COLS)
+    local cx    = CARD_GAP + col * (CARD_W + CARD_GAP)
+    local cy    = CARD_GAP + row * (CARD_H + CARD_GAP)
+    local sw    = swords[i]
+    local col3  = SWORD_COLORS[i]
+
+    local card = frame(CardGrid,
+        UDim2.new(0, CARD_W, 0, CARD_H),
+        UDim2.new(0, cx, 0, cy),
+        C(20,5,8), 0, 7, 10)
+    card.Name = "Card"..i
+
+    -- coloured header strip
+    local header = frame(card,
+        UDim2.new(1,0,0,22), UDim2.new(0,0,0,0),
+        col3, 0, 8, 10)
+    lbl(header, SWORD_NAMES[i].." · Blade   "..SWORD_STUDS[i].."st",
+        UDim2.new(0,8,0,0), UDim2.new(1,-8,1,0),
+        12, C(255,255,255), Enum.Font.Fondamento, Enum.TextXAlignment.Left, 9)
+
+    -- yaw stepper
+    lbl(card, "Yaw", UDim2.new(0,6,0,24), UDim2.new(0.4,0,0,12), 10, C(200,160,160))
+    local yd = btn(card, "−", UDim2.new(0.02,0,0,36), UDim2.new(0.13,0,0,20),
+        C(80,20,0), C(255,220,220), 13, 5)
+    local yv = Instance.new("TextLabel")
+    yv.Size  = UDim2.new(0.18,0,0,20); yv.Position = UDim2.new(0.16,0,0,36)
+    yv.Text  = "0°"; yv.BackgroundColor3 = C(25,5,5)
+    yv.TextColor3 = C(255,200,200); yv.Font = Enum.Font.Fondamento
+    yv.TextSize = 11; yv.BorderSizePixel = 0; yv.ZIndex = 8; yv.Parent = card
+    Instance.new("UICorner", yv).CornerRadius = UDim.new(0,4)
+    local yu = btn(card, "+", UDim2.new(0.35,0,0,36), UDim2.new(0.13,0,0,20),
+        C(120,20,0), C(255,220,220), 13, 5)
+    cardYawDisplays[i] = yv
+
+    -- pitch stepper
+    lbl(card, "Pitch", UDim2.new(0.5,0,0,24), UDim2.new(0.4,0,0,12), 10, C(200,160,160))
+    local pd = btn(card, "−", UDim2.new(0.52,0,0,36), UDim2.new(0.13,0,0,20),
+        C(80,20,0), C(255,220,220), 13, 5)
+    local pv = Instance.new("TextLabel")
+    pv.Size  = UDim2.new(0.18,0,0,20); pv.Position = UDim2.new(0.66,0,0,36)
+    pv.Text  = "0°"; pv.BackgroundColor3 = C(25,5,5)
+    pv.TextColor3 = C(255,200,200); pv.Font = Enum.Font.Fondamento
+    pv.TextSize = 11; pv.BorderSizePixel = 0; pv.ZIndex = 8; pv.Parent = card
+    Instance.new("UICorner", pv).CornerRadius = UDim.new(0,4)
+    local pu = btn(card, "+", UDim2.new(0.85,0,0,36), UDim2.new(0.13,0,0,20),
+        C(120,20,0), C(255,220,220), 13, 5)
+    cardPitchDisplays[i] = pv
+
+    -- snap button
+    local snap = btn(card, "Snap to position",
+        UDim2.new(0.02,0,0,60), UDim2.new(0.96,0,0,18),
+        C(0,50,110), C(120,180,255), 10, 5)
+
+    -- wire yaw
+    local swYawDeg = 0
+    yd.MouseButton1Click:Connect(function()
+        swYawDeg = (swYawDeg-15+360)%360
+        sw.yaw   = math.rad(swYawDeg)
+        yv.Text  = swYawDeg.."°"
+    end)
+    yu.MouseButton1Click:Connect(function()
+        swYawDeg = (swYawDeg+15)%360
+        sw.yaw   = math.rad(swYawDeg)
+        yv.Text  = swYawDeg.."°"
+    end)
+
+    -- wire pitch
+    local swPitchDeg = 0
+    pd.MouseButton1Click:Connect(function()
+        swPitchDeg = math.clamp(swPitchDeg-15,-80,80)
+        sw.pitch   = math.rad(swPitchDeg)
+        pv.Text    = swPitchDeg.."°"
+    end)
+    pu.MouseButton1Click:Connect(function()
+        swPitchDeg = math.clamp(swPitchDeg+15,-80,80)
+        sw.pitch   = math.rad(swPitchDeg)
+        pv.Text    = swPitchDeg.."°"
+    end)
+
+    -- snap
+    snap.MouseButton1Click:Connect(function()
+        if humanoidRootPart then
+            sw.centerPos       = sw.getFollowPos()
+            sw.anchor.Position = sw.centerPos
+            playSound("12221967")
+        end
+    end)
+end
+
+-- ─── Count buttons — wire after cards are built ───────────────────────────────
+local function setSwordCount(n)
+    activeSwordCount = n
+    for i = 1, SWORD_COUNT do
+        swords[i].enabled = (i <= n)
+        countBtns[i].BackgroundColor3 = (i <= n) and btnCols[i] or C(50,50,50)
+        fingerDots[i].Visible  = false
+        swords[i].fingerActive = false
+        swords[i].fingerTouch  = nil
+        swordDragY[i]          = nil
+        -- dim / undim cards
+        local card = CardGrid:FindFirstChild("Card"..i)
+        if card then card.BackgroundTransparency = (i <= n) and 0 or 0.55 end
+    end
+    touchToSword = {}
+    resetPartitions()
+    for i = 1, n do
+        swords[i].centerPos       = swords[i].getFollowPos()
+        swords[i].anchor.Position = swords[i].centerPos
+    end
+    playSound("12221967")
+end
+
+for i = 1, SWORD_COUNT do
+    countBtns[i].MouseButton1Click:Connect(function() setSwordCount(i) end)
+end
+
+-- ─── Spawn / character refresh ────────────────────────────────────────────────
+LocalPlayer.CharacterAdded:Connect(function(nc)
+    character        = nc
+    humanoidRootPart = nc:WaitForChild("HumanoidRootPart")
+    humanoid         = nc:WaitForChild("Humanoid")
+end)
+
+-- ─── Notification ─────────────────────────────────────────────────────────────
+pcall(function()
+    local uid = Players:GetUserIdFromNameAsync("DieStupidNinja")
+    local img = Players:GetUserThumbnailAsync(uid,
+        Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size420x420)
+    StarterGui:SetCore("SendNotification", {
+        Title    = "Devil's Blade 8-Sword",
+        Text     = "500-pt anatomical silhouette · line formation active",
+        Icon     = img,
+        Duration = 5,
+    })
+end)
+
+-- start with all 8 active
+setSwordCount(8)
