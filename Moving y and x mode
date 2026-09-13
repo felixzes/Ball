@@ -1,791 +1,515 @@
 --[[
-    Devil's Blade v4 — upgraded by noncombate
-    Modes: Formation · Orbit · Vortex · Blackhole · Storm · Shield
-    Position: always 45 studs camera-left, locked to HRP Y
+    Singularity — 1 ball, pulls all unanchored parts, leaves trail on drag
+    finger drag only, no joystick
 ]]
 
 local Players          = game:GetService("Players")
 local RunService       = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
-local SoundService     = game:GetService("SoundService")
+local TweenService     = game:GetService("TweenService")
 local StarterGui       = game:GetService("StarterGui")
 local Workspace        = game:GetService("Workspace")
-local TweenService     = game:GetService("TweenService")
 local LocalPlayer      = Players.LocalPlayer
 local character        = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
 local humanoidRootPart = character:WaitForChild("HumanoidRootPart")
-local humanoid         = character:WaitForChild("Humanoid")
 
 -- ─── Network bypass ──────────────────────────────────────────────────────────
-if not getgenv().Network then
-    getgenv().Network = { BaseParts={}, Velocity=Vector3.new(14.46,14.46,14.46) }
-    local N = getgenv().Network
-    N.RetainPart = function(p)
-        if typeof(p)~="Instance" then return end
-        if not p:IsA("BasePart") then return end
-        if not p:IsDescendantOf(Workspace) then return end
-        if table.find(N.BaseParts,p) then return end
-        table.insert(N.BaseParts,p)
-        p.CustomPhysicalProperties = PhysicalProperties.new(0,0,0,0,0)
-        p.CanCollide = false
-    end
+if not getgenv().SingNet then
+    getgenv().SingNet = { parts = {} }
+    local N = getgenv().SingNet
     LocalPlayer.ReplicationFocus = Workspace
     RunService.Heartbeat:Connect(function()
         pcall(function()
             sethiddenproperty(LocalPlayer,"SimulationRadius",100000)
             sethiddenproperty(LocalPlayer,"MaxSimulationRadius",100000)
         end)
-        for _,p in pairs(N.BaseParts) do
-            if p and p.Parent and p:IsDescendantOf(Workspace) then
-                p.Velocity = N.Velocity
+        for _,p in pairs(N.parts) do
+            if p and p.Parent then
+                p.Velocity = Vector3.new(14,14,14)
             end
         end
     end)
 end
 
-local function playSound(id)
-    local s = Instance.new("Sound")
-    s.SoundId = "rbxassetid://"..tostring(id)
-    s.Parent  = SoundService
-    s:Play()
-    s.Ended:Connect(function() s:Destroy() end)
+-- ─── Config ───────────────────────────────────────────────────────────────────
+local CFG = {
+    pullRadius    = 80,
+    pullForce     = 220,
+    ballRadius    = 3,
+    trailLength   = 120,   -- max trail segments kept
+    trailWidth    = 0.35,
+    trailLifetime = 6,     -- seconds before trail segment fades
+    ballColor     = Color3.fromRGB(120, 40, 255),
+    trailColor    = Color3.fromRGB(180, 80, 255),
+    trailColor2   = Color3.fromRGB(60, 0, 140),
+    enabled       = false,
+}
+
+-- ─── State ────────────────────────────────────────────────────────────────────
+local ballPos      = humanoidRootPart.Position + Vector3.new(0, 0, -10)
+local dragging     = false
+local dragTouch    = nil
+local dragPlaneY   = ballPos.Y
+local trailNodes   = {}   -- {pos, time}
+local trailParts   = {}   -- visual beam segments
+local pulledParts  = {}
+
+-- ─── Ball visual ─────────────────────────────────────────────────────────────
+local ballFolder = Instance.new("Folder", Workspace)
+ballFolder.Name  = "SingularityBall"
+
+local ballPart = Instance.new("Part", ballFolder)
+ballPart.Name         = "Ball"
+ballPart.Shape        = Enum.PartType.Ball
+ballPart.Size         = Vector3.new(CFG.ballRadius*2, CFG.ballRadius*2, CFG.ballRadius*2)
+ballPart.Anchored     = true
+ballPart.CanCollide   = false
+ballPart.CastShadow   = false
+ballPart.Material     = Enum.Material.Neon
+ballPart.Color        = CFG.ballColor
+ballPart.Position     = ballPos
+ballPart.Parent       = ballFolder
+
+-- glow
+local ballLight = Instance.new("PointLight", ballPart)
+ballLight.Brightness = 5
+ballLight.Range      = CFG.pullRadius * 0.4
+ballLight.Color      = CFG.ballColor
+
+-- pulse loop
+local pulseConn
+local function startPulse()
+    local t = 0
+    pulseConn = RunService.Heartbeat:Connect(function(dt)
+        t = t + dt
+        local scale = 1 + math.sin(t * 3) * 0.08
+        ballPart.Size = Vector3.new(
+            CFG.ballRadius*2*scale,
+            CFG.ballRadius*2*scale,
+            CFG.ballRadius*2*scale
+        )
+        ballLight.Brightness = 4 + math.sin(t*4)*2
+    end)
 end
-playSound("2865227271")
+startPulse()
 
--- ════════════════════════════════════════════════════════════════════════════
---  500-POINT ANATOMICAL TARGET TABLE
--- ════════════════════════════════════════════════════════════════════════════
-local TARGETS = {}
-local PHI = (1+math.sqrt(5))/2
-local function ring(i,n,r,fz) local a=2*math.pi*(i-1)/n return r*math.cos(a),r*math.sin(a)*(fz or 1) end
-local function sunflower(i,n,R,fz) local r=R*math.sqrt(i/n) local a=2*math.pi*i/(PHI*PHI) return r*math.cos(a),r*math.sin(a)*(fz or 1) end
-local function bez3(t,p0,p1,p2,p3) local u=1-t return u^3*p0+3*u^2*t*p1+3*u*t^2*p2+t^3*p3 end
-local function jit(i,s) return ((i*1619+s*1013)%1000)/500-1 end
-for i=1,24 do local x,z=ring(i,24,10.5,0.30) table.insert(TARGETS,{x=x,y=-57+(i%4)*0.6,z=z}) end
-for i=1,18 do local x,z=ring(i,18,7.0,0.30) table.insert(TARGETS,{x=x,y=-56+(i%3)*0.7,z=z}) end
-for i=1,20 do local x,z=sunflower(i,20,6.2,0.28) table.insert(TARGETS,{x=x,y=-55.5+(i%4)*0.5,z=z}) end
-for i=1,8  do local x,z=sunflower(i,8,2.8,0.18) table.insert(TARGETS,{x=x,y=-55+i*0.1,z=z}) end
-for i=1,32 do local lt=(i-1)/31 local y=-50+lt*8 local r=2.4+math.sin(lt*math.pi*5)*0.9 local a=2*math.pi*i/PHI table.insert(TARGETS,{x=r*math.cos(a),y=y,z=r*math.sin(a)*0.42}) end
-for i=1,16 do local lt=(i-1)/15 table.insert(TARGETS,{x=-11+lt*22,y=-40+(i%3)*0.7,z=jit(i,1)*1.6}) end
-for i=1,22 do local t=(i-1)/21 local tk=(1-t)*3.8+0.5 table.insert(TARGETS,{x=bez3(t,-11,-20,-25,-24)+jit(i,3)*tk*0.4,y=bez3(t,-40,-39,-37,-34),z=jit(i,2)*tk*0.5}) end
-for i=1,22 do local t=(i-1)/21 local tk=(1-t)*3.8+0.5 table.insert(TARGETS,{x=bez3(t,11,20,25,24)+jit(i,5)*tk*0.4,y=bez3(t,-40,-39,-37,-34),z=jit(i,4)*tk*0.5}) end
-for i=1,8  do local a=2*math.pi*(i-1)/8 table.insert(TARGETS,{x=-24+math.cos(a)*2.8,y=-34+math.sin(a)*2.2,z=jit(i,6)*0.9}) end
-for i=1,8  do local a=2*math.pi*(i-1)/8 table.insert(TARGETS,{x=24+math.cos(a)*2.8,y=-34+math.sin(a)*2.2,z=jit(i,7)*0.9}) end
-for i=1,10 do local lt=(i-1)/9 local tk=(1-lt)*2.8+0.3 table.insert(TARGETS,{x=bez3(lt,-9,-14,-16,-13),y=bez3(lt,-40,-43,-47,-49),z=jit(i,8)*tk*0.4}) end
-for i=1,10 do local lt=(i-1)/9 local tk=(1-lt)*2.8+0.3 table.insert(TARGETS,{x=bez3(lt,9,14,16,13),y=bez3(lt,-40,-43,-47,-49),z=jit(i,9)*tk*0.4}) end
-for i=1,4  do table.insert(TARGETS,{x=-3.6,y=-38-(i-1)/3*6,z=jit(i,10)*0.3}) end
-for i=1,4  do table.insert(TARGETS,{x=3.6, y=-38-(i-1)/3*6,z=jit(i,11)*0.3}) end
-local BRY=-14 local BTY=60 local BMW=13.5 local BMD=2.2
-local function bp(y) if y<=BRY then return BMW,BMD end if y>=BTY then return 0,0 end local be=54 if y<=be then local t=(y-BRY)/(be-BRY) return math.max(0,BMW*(1-t^1.6)),math.max(0,BMD*(1-t^1.3)) end local t=(y-be)/(BTY-be) return BMW*(1-t)*0.08,BMD*(1-t)*0.18 end
-for i=1,16 do local lt=(i-1)/15 local y=-22+lt*8 local hw,hd=bp(y) local a=2*math.pi*i/PHI local r=math.sqrt((i-0.5)/16) table.insert(TARGETS,{x=r*hw*math.cos(a),y=y,z=r*hd*math.sin(a)}) end
-for i=1,8  do local a=2*math.pi*(i-1)/8 local hw,hd=bp(-14) table.insert(TARGETS,{x=hw*math.cos(a),y=-14+(i%3)*0.4,z=hd*math.sin(a)}) end
-for i=1,64 do local lt=(i-1)/63 local y=-14+lt*42 local hw,hd=bp(y) local m=i%10 local x,z if m<4 then local s=(i%2==0)and 1 or -1 x=s*(hw*0.93+jit(i,12)*0.9);z=jit(i,13)*hd*0.45 elseif m<7 then x=jit(i,14)*hw*0.80;z=(i%2==0 and 1 or -1)*(hd*0.88+jit(i,15)*0.15) elseif m<9 then local a=2*math.pi*i/PHI local r=math.sqrt(((i-1)%16+0.5)/16) x=r*hw*math.cos(a);z=r*hd*math.sin(a) else x=jit(i,16)*hw*0.18;z=jit(i,17)*0.20 end table.insert(TARGETS,{x=x,y=y,z=z}) end
-for i=1,14 do local lt=(i-1)/13 local y=-14+lt*46 local hw,_=bp(y) table.insert(TARGETS,{x=jit(i,18)*hw*0.20,y=y,z=jit(i,19)*0.18}) end
-for i=1,40 do local lt=(i-1)/39 local y=28+lt*16 local hw,hd=bp(y) local m=i%8 local x,z if m<3 then local s=(i%2==0)and 1 or -1 x=s*(hw*0.92+jit(i,20)*0.6);z=jit(i,21)*hd*0.4 elseif m<6 then x=jit(i,22)*hw*0.75;z=(i%2==0 and 1 or -1)*(hd*0.85+jit(i,23)*0.12) else local a=2*math.pi*i/PHI local r=math.sqrt(((i-1)%12+0.5)/16) x=r*hw*math.cos(a);z=r*hd*math.sin(a) end table.insert(TARGETS,{x=x,y=y,z=z}) end
-for i=1,32 do local lt=(i-1)/31 local y=44+lt*10 local hw,hd=bp(y) hw=math.max(hw,0.05) local m=i%6 local x,z if m<2 then local s=(i%2==0)and 1 or -1 x=s*(hw*0.94+jit(i,24)*0.4);z=jit(i,25)*hd*0.35 elseif m<4 then x=jit(i,26)*hw*0.70;z=(i%2==0 and 1 or -1)*(hd*0.82+jit(i,27)*0.10) else local a=2*math.pi*i/PHI local r=math.sqrt(((i-1)%8+0.5)/8) x=r*hw*math.cos(a);z=r*hd*math.sin(a) end table.insert(TARGETS,{x=x,y=y,z=z}) end
-for i=1,14 do local lt=(i-1)/13 local y=44+lt*12 local hw,hd=bp(y) table.insert(TARGETS,{x=jit(i,28)*hw*0.55,y=y,z=hd*0.70+jit(i,29)*hd*0.25}) end
-for i=1,16 do local lt=(i-1)/15 local y=54+lt*4 local hw,hd=bp(y) hw=math.max(hw,0.03) local a=2*math.pi*i/PHI local r=math.sqrt((i-0.5)/16) table.insert(TARGETS,{x=r*hw*math.cos(a),y=y,z=r*hd*math.sin(a)}) end
-for i=1,8  do local lt=(i-1)/7 local y=58+lt*2 local hw=0.5*(1-lt) local a=2*math.pi*i/PHI table.insert(TARGETS,{x=hw*math.cos(a),y=y,z=hw*math.sin(a)*0.15}) end
-while #TARGETS<500 do table.insert(TARGETS,{x=0,y=60,z=0}) end
-for i=#TARGETS,501,-1 do TARGETS[i]=nil end
-local function getSlot(i) return TARGETS[((i-1)%500)+1] end
+-- ─── Trail system ─────────────────────────────────────────────────────────────
+local trailFolder = Instance.new("Folder", Workspace)
+trailFolder.Name  = "SingularityTrail"
 
--- ════════════════════════════════════════════════════════════════════════════
---  POSITION ENGINE — always camera-left, HRP Y locked
--- ════════════════════════════════════════════════════════════════════════════
+local function makeTrailSegment(a, b)
+    local mid  = (a + b) / 2
+    local dist = (b - a).Magnitude
+    if dist < 0.1 then return nil end
 
-local function getLeft()
-    if not humanoidRootPart then return Vector3.new(1,0,0) end
-    local cam  = Workspace.CurrentCamera
-    local look = cam and cam.CFrame.LookVector or humanoidRootPart.CFrame.LookVector
-    look = Vector3.new(look.X,0,look.Z)
-    if look.Magnitude < 0.001 then look = Vector3.new(0,0,1) end
-    look = look.Unit
-    return Vector3.new(-look.Z,0,look.X)
-end
+    local seg = Instance.new("Part", trailFolder)
+    seg.Anchored     = true
+    seg.CanCollide   = false
+    seg.CastShadow   = false
+    seg.Material     = Enum.Material.Neon
+    seg.Color        = CFG.trailColor
+    seg.Size         = Vector3.new(CFG.trailWidth, CFG.trailWidth, dist)
+    seg.CFrame       = CFrame.new(mid, b)
 
-local function getSidePos(si)
-    if not humanoidRootPart then return Vector3.new() end
-    local left = getLeft()
-    local dist = 45 + (si-1)*4
-    local hrp  = humanoidRootPart.Position
-    return Vector3.new(hrp.X + left.X*dist, hrp.Y, hrp.Z + left.Z*dist)
-end
+    -- fade out
+    local born = os.clock()
+    local conn
+    conn = RunService.Heartbeat:Connect(function()
+        if not seg or not seg.Parent then conn:Disconnect() return end
+        local age = os.clock() - born
+        if age >= CFG.trailLifetime then
+            seg:Destroy()
+            conn:Disconnect()
+            return
+        end
+        local alpha = 1 - (age / CFG.trailLifetime)
+        seg.Transparency = 1 - alpha
+        -- color lerp purple → dark
+        seg.Color = CFG.trailColor:Lerp(CFG.trailColor2, 1 - alpha)
+    end)
 
--- ════════════════════════════════════════════════════════════════════════════
---  MODE SYSTEM
--- ════════════════════════════════════════════════════════════════════════════
-local MODES       = {"Formation","Orbit","Vortex","Blackhole","Storm","Shield"}
-local currentMode = "Formation"
-local modeTime    = 0
-
-local BH_RING_RADII  = {0,18,18,18,36,36,36,36}
-local BH_RING_ANGLES = {0,0,120,240,0,90,180,270}
-local bhCenter       = Vector3.new()
-local bhDragging     = false
-local bhDragTouch    = nil
-local bhSuckRadius   = 60
-local bhSuckForce    = 180
-local bhSpinSpeed    = 2.0
-
-local function getFormationPos(si)
-    return getSidePos(si)
-end
-
-local function getOrbitPos(si,t)
-    if not humanoidRootPart then return Vector3.new() end
-    local base  = getSidePos(1)
-    local angle = t*1.2 + (si-1)*(2*math.pi/8)
-    local r     = 10
-    return Vector3.new(base.X+math.cos(angle)*r, humanoidRootPart.Position.Y, base.Z+math.sin(angle)*r)
-end
-
-local function getVortexPos(si,t)
-    if not humanoidRootPart then return Vector3.new() end
-    local base  = getSidePos(1)
-    local angle = t*2.5 + (si-1)*(2*math.pi/8)
-    local r     = 6 + (si-1)*2
-    return Vector3.new(base.X+math.cos(angle)*r, humanoidRootPart.Position.Y, base.Z+math.sin(angle)*r)
+    return seg
 end
 
-local function getBlackholePos(si,t)
-    local ringR   = BH_RING_RADII[si]
-    local baseAng = math.rad(BH_RING_ANGLES[si])
-    local spin    = si==1 and 0 or (ringR<=20 and t*bhSpinSpeed or -t*bhSpinSpeed*0.6)
-    local angle   = baseAng+spin
-    return Vector3.new(bhCenter.X+math.cos(angle)*ringR, bhCenter.Y, bhCenter.Z+math.sin(angle)*ringR)
-end
+local lastTrailPos = ballPos
+local MIN_TRAIL_DIST = 1.2
 
-local function getStormPos(si,t)
-    if not humanoidRootPart then return Vector3.new() end
-    local base  = getSidePos(1)
-    local angle = t*4 + (si-1)*(2*math.pi/8)
-    local r     = 5
-    return Vector3.new(base.X+math.cos(angle)*r, humanoidRootPart.Position.Y, base.Z+math.sin(angle)*r)
-end
+local function updateTrail()
+    local dist = (ballPos - lastTrailPos).Magnitude
+    if dist < MIN_TRAIL_DIST then return end
 
-local function getShieldPos(si,t)
-    if not humanoidRootPart then return Vector3.new() end
-    local base  = getSidePos(1)
-    local angle = (si-1)*(2*math.pi/8) + t*0.4
-    local r     = 10
-    return Vector3.new(base.X+math.cos(angle)*r, humanoidRootPart.Position.Y, base.Z+math.sin(angle)*r)
-end
+    makeTrailSegment(lastTrailPos, ballPos)
+    lastTrailPos = ballPos
 
-local function getTargetPos(si,t)
-    if currentMode=="Formation"  then return getFormationPos(si)
-    elseif currentMode=="Orbit"  then return getOrbitPos(si,t)
-    elseif currentMode=="Vortex" then return getVortexPos(si,t)
-    elseif currentMode=="Blackhole" then return getBlackholePos(si,t)
-    elseif currentMode=="Storm"  then return getStormPos(si,t)
-    elseif currentMode=="Shield" then return getShieldPos(si,t)
+    -- trim old nodes
+    if #trailParts > CFG.trailLength then
+        local old = table.remove(trailParts, 1)
+        if old and old.Parent then old:Destroy() end
     end
-    return getFormationPos(si)
 end
 
--- ════════════════════════════════════════════════════════════════════════════
---  SWORD SYSTEM
--- ════════════════════════════════════════════════════════════════════════════
-local SWORD_COUNT      = 8
-local partOwner        = {}
-local partCounter      = 0
-local activeSwordCount = 8
-local swords           = {}
-
-local function tagName(si,k) return ("DB_%d_%s"):format(si,k) end
-
+-- ─── Part eligibility ─────────────────────────────────────────────────────────
 local function isEligible(p)
     if not p:IsA("BasePart") then return false end
     if p.Anchored then return false end
     if not p:IsDescendantOf(Workspace) then return false end
-    for _,sw in ipairs(swords) do
-        if sw.folder and p:IsDescendantOf(sw.folder) then return false end
-    end
+    if p == ballPart then return false end
+    if p:IsDescendantOf(ballFolder) then return false end
+    if p:IsDescendantOf(trailFolder) then return false end
     if LocalPlayer.Character and p:IsDescendantOf(LocalPlayer.Character) then return false end
-    local a=p.Parent
-    while a and a~=Workspace do
-        if a:FindFirstChild("Humanoid") or a:FindFirstChild("Head") then return false end
-        a=a.Parent
+    local a = p.Parent
+    while a and a ~= Workspace do
+        if a:FindFirstChild("Humanoid") then return false end
+        a = a.Parent
     end
     return true
 end
 
-local function cleanPart(p,si)
-    if not p or not p.Parent then return end
-    for _,n in ipairs({tagName(si,"Att"),tagName(si,"AP"),tagName(si,"AO")}) do
-        local c=p:FindFirstChild(n) if c then c:Destroy() end
-    end
-end
-
-local function forcePart(p,sw)
-    local si=sw.slotIndex
-    for _,x in next,p:GetChildren() do
-        if x:IsA("BodyAngularVelocity") or x:IsA("BodyForce") or x:IsA("BodyGyro")
-        or x:IsA("BodyPosition") or x:IsA("BodyThrust") or x:IsA("BodyVelocity")
-        or x:IsA("RocketPropulsion") then x:Destroy() end
-    end
-    cleanPart(p,si)
-    p.CanCollide=false
-    local att=Instance.new("Attachment",p) att.Name=tagName(si,"Att")
-    local ancAtt=Instance.new("Attachment",sw.anchor)
-    ancAtt.Name=tagName(si,"AncAtt").."_"..tostring(p:GetDebugId())
-    local ap=Instance.new("AlignPosition",p) ap.Name=tagName(si,"AP")
-    ap.MaxForce=math.huge ap.MaxVelocity=math.huge ap.Responsiveness=200
-    ap.Attachment0=att ap.Attachment1=ancAtt
-    local ao=Instance.new("AlignOrientation",p) ao.Name=tagName(si,"AO")
-    ao.MaxAngularVelocity=math.huge ao.MaxTorque=math.huge ao.Responsiveness=200
-    ao.Attachment0=att ao.Attachment1=ancAtt
-    sw._anchorAtts[p]=ancAtt
-end
-
-local function createSword(slotIndex)
-    local sw={}
-    sw.slotIndex=slotIndex sw.enabled=true
-    sw.fingerActive=false sw.fingerTouch=nil
-    sw.yaw=0 sw.pitch=0 sw.parts={} sw._anchorAtts={}
-    sw.centerPos=humanoidRootPart and humanoidRootPart.Position or Vector3.new()
-    sw.folder=Instance.new("Folder",Workspace) sw.folder.Name="DB_SW"..slotIndex
-    sw.anchor=Instance.new("Part",sw.folder)
-    sw.anchor.Anchored=true sw.anchor.CanCollide=false
-    sw.anchor.Transparency=1 sw.anchor.Size=Vector3.new(1,1,1)
-    sw.anchor.Position=sw.centerPos
-    sw.rot=function(x,y,z)
-        local cy,sy=math.cos(sw.yaw),math.sin(sw.yaw)
-        local cp,sp=math.cos(sw.pitch),math.sin(sw.pitch)
-        local rx=cy*x-sy*z local rz=sy*x+cy*z
-        return rx,cp*y-sp*rz,sp*y+cp*rz
-    end
-    sw.removePart=function(p)
-        local idx=table.find(sw.parts,p) if idx then table.remove(sw.parts,idx) end
-        if partOwner[p]==slotIndex then partOwner[p]=nil end
-        cleanPart(p,slotIndex)
-        if sw._anchorAtts[p] then sw._anchorAtts[p]:Destroy() sw._anchorAtts[p]=nil end
-    end
-    sw.addPart=function(p)
-        if not sw.enabled then return end
-        if not isEligible(p) then return end
-        if table.find(sw.parts,p) then return end
-        local owner=partOwner[p]
-        if owner==nil then
-            if activeSwordCount==0 then return end
-            partCounter=partCounter+1
-            local assigned=((partCounter-1)%activeSwordCount)+1
-            partOwner[p]=assigned owner=assigned
-        end
-        if owner~=slotIndex then return end
-        if getgenv().Network then getgenv().Network.RetainPart(p) end
-        forcePart(p,sw) table.insert(sw.parts,p)
-    end
-    return sw
-end
-
-for i=1,SWORD_COUNT do table.insert(swords,createSword(i)) end
-
-local function resetPartitions()
-    for _,sw in ipairs(swords) do
-        for _,p in ipairs(sw.parts) do
-            cleanPart(p,sw.slotIndex)
-            if sw._anchorAtts[p] then sw._anchorAtts[p]:Destroy() sw._anchorAtts[p]=nil end
-        end
-        sw.parts={}
-        for _,ch in ipairs(sw.anchor:GetChildren()) do
-            if ch:IsA("Attachment") then ch:Destroy() end
-        end
-        sw._anchorAtts={}
-    end
-    partOwner={} partCounter=0
-    if activeSwordCount==0 then return end
-    local pool={}
-    for _,p in ipairs(Workspace:GetDescendants()) do
-        if isEligible(p) then table.insert(pool,p) end
-    end
-    for i,p in ipairs(pool) do
-        local assigned=((i-1)%activeSwordCount)+1
-        partOwner[p]=assigned partCounter=i
-        local sw=swords[assigned]
-        if sw.enabled then
-            if getgenv().Network then getgenv().Network.RetainPart(p) end
-            forcePart(p,sw) table.insert(sw.parts,p)
-        end
-    end
-end
-
-local function globalAdd(p)
-    if activeSwordCount==0 then return end
-    if partOwner[p] then
-        local sw=swords[partOwner[p]]
-        if sw and sw.enabled and not table.find(sw.parts,p) and isEligible(p) then
-            forcePart(p,sw) table.insert(sw.parts,p)
-        end
-        return
-    end
-    if not isEligible(p) then return end
-    partCounter=partCounter+1
-    local assigned=((partCounter-1)%activeSwordCount)+1
-    partOwner[p]=assigned
-    local sw=swords[assigned]
-    if sw and sw.enabled then
-        if getgenv().Network then getgenv().Network.RetainPart(p) end
-        forcePart(p,sw) table.insert(sw.parts,p)
-    end
-end
-
-local function globalRemove(p)
-    local si=partOwner[p]
-    if si then local sw=swords[si] if sw then sw.removePart(p) end end
-    partOwner[p]=nil
-end
-
-Workspace.DescendantAdded:Connect(function(p) task.defer(function() globalAdd(p) end) end)
-Workspace.DescendantRemoving:Connect(globalRemove)
-
-local _sc=0
+-- ─── Pull engine ─────────────────────────────────────────────────────────────
 RunService.Heartbeat:Connect(function(dt)
-    _sc=_sc+dt if _sc<2 then return end _sc=0
-    for _,p in ipairs(Workspace:GetDescendants()) do
-        if p:IsA("BasePart") and not p.Anchored and not partOwner[p] then globalAdd(p) end
-    end
-end)
+    if not CFG.enabled then return end
 
--- ─── Main loop ───────────────────────────────────────────────────────────────
-RunService.Heartbeat:Connect(function(dt)
-    modeTime=modeTime+dt
+    -- move ball visual
+    ballPart.Position = ballPos
 
-    if currentMode=="Blackhole" then
-        for _,sw in ipairs(swords) do
-            if not sw.enabled then continue end
-            local center=sw.anchor.Position
-            for _,p in ipairs(Workspace:GetDescendants()) do
-                if p:IsA("BasePart") and not p.Anchored and isEligible(p) then
-                    local diff=center-p.Position
-                    local dist=diff.Magnitude
-                    if dist<bhSuckRadius and dist>0.5 then
-                        local force=diff.Unit*bhSuckForce*(1-dist/bhSuckRadius)
-                        p.AssemblyLinearVelocity=p.AssemblyLinearVelocity+force*dt
-                    end
+    -- trail
+    updateTrail()
+
+    -- pull all eligible parts toward ball
+    for _, p in ipairs(Workspace:GetDescendants()) do
+        if isEligible(p) then
+            local diff = ballPos - p.Position
+            local dist = diff.Magnitude
+            if dist < CFG.pullRadius and dist > CFG.ballRadius then
+                -- retain via network
+                if not table.find(getgenv().SingNet.parts, p) then
+                    table.insert(getgenv().SingNet.parts, p)
+                    p.CustomPhysicalProperties = PhysicalProperties.new(0,0,0,0,0)
+                    p.CanCollide = false
                 end
-            end
-        end
-    end
-
-    for i,sw in ipairs(swords) do
-        if not sw.enabled then continue end
-        if currentMode=="Blackhole" then
-            if not bhDragging then
-                sw.centerPos=getBlackholePos(i,modeTime)
-                sw.anchor.Position=sw.centerPos
-            end
-        elseif not sw.fingerActive then
-            sw.centerPos=getTargetPos(i,modeTime)
-            sw.anchor.Position=sw.centerPos
-        end
-        local ancPos=sw.anchor.Position
-        local idx=0
-        for _,part in ipairs(sw.parts) do
-            if part.Parent and not part.Anchored then
-                idx=idx+1
-                local s=getSlot(idx)
-                local rx,ry,rz=sw.rot(s.x,s.y,s.z)
-                local target=ancPos+Vector3.new(rx,ry,rz)
-                local ancAtt=sw._anchorAtts[part]
-                if ancAtt then ancAtt.WorldPosition=target end
+                local strength = CFG.pullForce * (1 - dist / CFG.pullRadius)
+                p.AssemblyLinearVelocity = p.AssemblyLinearVelocity + diff.Unit * strength * dt
             end
         end
     end
 end)
 
--- ════════════════════════════════════════════════════════════════════════════
---  GUI
--- ════════════════════════════════════════════════════════════════════════════
-local C=Color3.fromRGB
-
-local ScreenGui=Instance.new("ScreenGui")
-ScreenGui.Name="DevilsBladeGUI_v4"
-ScreenGui.ResetOnSpawn=false
-ScreenGui.ZIndexBehavior=Enum.ZIndexBehavior.Sibling
-ScreenGui.IgnoreGuiInset=true
-ScreenGui.Parent=LocalPlayer:WaitForChild("PlayerGui")
-
-local overlay=Instance.new("Frame")
-overlay.Size=UDim2.new(1,0,1,0)
-overlay.BackgroundTransparency=1
-overlay.BorderSizePixel=0
-overlay.ZIndex=0
-overlay.Parent=ScreenGui
-
-local function mkFrame(parent,size,pos,bg,bgT,z,r)
-    local f=Instance.new("Frame")
-    f.Size=size f.Position=pos or UDim2.new(0,0,0,0)
-    f.BackgroundColor3=bg or C(18,4,4) f.BackgroundTransparency=bgT or 0
-    f.BorderSizePixel=0 f.ZIndex=z or 5 f.Parent=parent
-    if r then Instance.new("UICorner",f).CornerRadius=UDim.new(0,r) end
-    return f
-end
-local function mkLbl(parent,text,pos,size,fs,fc,font,align,z)
-    local L=Instance.new("TextLabel")
-    L.Size=size or UDim2.new(1,0,0,18) L.Position=pos or UDim2.new(0,0,0,0)
-    L.Text=text L.TextColor3=fc or C(255,180,180)
-    L.BackgroundTransparency=1 L.Font=font or Enum.Font.Fondamento
-    L.TextSize=fs or 11 L.TextXAlignment=align or Enum.TextXAlignment.Left
-    L.BorderSizePixel=0 L.ZIndex=z or 7 L.Parent=parent
-    return L
-end
-local function mkBtn(parent,text,pos,size,bg,tc,fs,r)
-    local B=Instance.new("TextButton")
-    B.Size=size or UDim2.new(0.8,0,0,26) B.Position=pos or UDim2.new(0.1,0,0,0)
-    B.Text=text B.BackgroundColor3=bg or C(140,0,0)
-    B.TextColor3=tc or C(255,255,255)
-    B.Font=Enum.Font.Fondamento B.TextSize=fs or 13
-    B.BorderSizePixel=0 B.ZIndex=8 B.Parent=parent
-    Instance.new("UICorner",B).CornerRadius=UDim.new(0,r or 8)
-    return B
-end
-local function mkStroke(parent,col,t)
-    local s=Instance.new("UIStroke",parent)
-    s.Color=col or C(80,0,0) s.Thickness=t or 1.2
-    return s
+-- ─── Screen to world ─────────────────────────────────────────────────────────
+local function screenToWorld(sp, planeY)
+    local cam = Workspace.CurrentCamera
+    if not cam then return nil end
+    local ray = cam:ScreenPointToRay(sp.X, sp.Y)
+    local d   = ray.Direction
+    if math.abs(d.Y) < 0.0001 then return nil end
+    local t = (planeY - ray.Origin.Y) / d.Y
+    if t <= 0 then return nil end
+    return ray.Origin + d * t
 end
 
-local PANEL_W=460
-local PANEL_H=560
+-- ─── GUI ─────────────────────────────────────────────────────────────────────
+local C = Color3.fromRGB
 
-local Main=mkFrame(ScreenGui,
-    UDim2.new(0,PANEL_W,0,PANEL_H),
-    UDim2.new(0.5,-PANEL_W/2,0.5,-PANEL_H/2),
-    C(10,3,6),0,5,16)
-Main.ClipsDescendants=true
-mkStroke(Main,C(100,0,40),1.5)
+local sg = Instance.new("ScreenGui")
+sg.Name           = "SingularityGUI"
+sg.ResetOnSpawn   = false
+sg.IgnoreGuiInset = true
+sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+sg.Parent         = LocalPlayer:WaitForChild("PlayerGui")
 
-local TBar=mkFrame(Main,UDim2.new(1,0,0,38),UDim2.new(0,0,0,0),C(70,0,25),0,6,0)
-Instance.new("UICorner",TBar).CornerRadius=UDim.new(0,16)
-mkStroke(TBar,C(180,0,60),1)
-mkLbl(TBar,"⚔  DEVIL'S BLADE  v4",UDim2.new(0,12,0,0),UDim2.new(0.65,0,1,0),
-    14,C(255,120,150),Enum.Font.Fondamento,Enum.TextXAlignment.Left,9)
-local modeLbl=mkLbl(TBar,"● Formation",UDim2.new(0.66,0,0,0),UDim2.new(0.28,0,1,0),
-    11,C(255,200,220),Enum.Font.GothamBold,Enum.TextXAlignment.Right,9)
+-- drag overlay — captures all finger input
+local dragOverlay = Instance.new("Frame")
+dragOverlay.Size                   = UDim2.new(1,0,1,0)
+dragOverlay.BackgroundTransparency = 1
+dragOverlay.BorderSizePixel        = 0
+dragOverlay.ZIndex                 = 0
+dragOverlay.Parent                 = sg
 
--- drag
-local panDrag=false local panTouch=nil local panOrigin=Vector2.new() local panStart
-TBar.InputBegan:Connect(function(inp)
-    if (inp.UserInputType==Enum.UserInputType.MouseButton1
-    or inp.UserInputType==Enum.UserInputType.Touch) and not panDrag then
-        panDrag=true panTouch=inp
-        panOrigin=Vector2.new(inp.Position.X,inp.Position.Y)
-        panStart=Main.Position
-    end
-end)
-UserInputService.InputChanged:Connect(function(inp)
-    if panDrag and inp==panTouch then
-        Main.Position=UDim2.new(
-            panStart.X.Scale,panStart.X.Offset+(inp.Position.X-panOrigin.X),
-            panStart.Y.Scale,panStart.Y.Offset+(inp.Position.Y-panOrigin.Y))
-    end
-end)
-UserInputService.InputEnded:Connect(function(inp)
-    if inp==panTouch then panDrag=false panTouch=nil end
-end)
+-- panel
+local panel = Instance.new("Frame")
+panel.Size             = UDim2.new(0, 280, 0, 320)
+panel.Position         = UDim2.new(0.5,-140, 0.5,-160)
+panel.BackgroundColor3 = C(8, 4, 16)
+panel.BorderSizePixel  = 0
+panel.Active           = true
+panel.Draggable        = true
+panel.Parent           = sg
+Instance.new("UICorner", panel).CornerRadius = UDim.new(0, 14)
+local ps = Instance.new("UIStroke", panel)
+ps.Thickness = 1.5
+ps.Color     = C(80, 0, 160)
 
--- minimize
-local minimized=false
-local minB=mkBtn(Main,"−",UDim2.new(1,-36,0,6),UDim2.new(0,26,0,26),C(110,0,30),C(255,180,200),16,8)
-minB.ZIndex=10
-minB.MouseButton1Click:Connect(function()
-    minimized=not minimized
-    for _,c in ipairs(Main:GetChildren()) do
-        if c~=minB and c.Name~="UICorner" and c.Name~="UIStroke" and c:IsA("GuiObject") then
-            c.Visible=not minimized
-        end
-    end
-    minB.Text=minimized and "+" or "−"
-    minB.Visible=true
-    Main.Size=minimized and UDim2.new(0,PANEL_W,0,44) or UDim2.new(0,PANEL_W,0,PANEL_H)
-end)
+-- header
+local hdr = Instance.new("Frame")
+hdr.Size             = UDim2.new(1,0,0,40)
+hdr.BackgroundColor3 = C(30, 0, 60)
+hdr.BorderSizePixel  = 0
+hdr.Parent           = panel
+Instance.new("UICorner", hdr).CornerRadius = UDim.new(0,14)
+Instance.new("UIStroke", hdr).Color = C(100,0,200)
 
--- mode strip
-local modeColors={Formation=C(180,40,60),Orbit=C(40,100,220),Vortex=C(120,40,200),Blackhole=C(20,20,20),Storm=C(200,140,20),Shield=C(20,140,80)}
-local modeStrip=mkFrame(Main,UDim2.new(1,-16,0,34),UDim2.new(0,8,0,44),C(16,4,10),0,6,10)
-mkStroke(modeStrip,C(80,0,40),1)
-local modeBtnList={}
-local modeW=math.floor((PANEL_W-16)/#MODES)
-for i,mname in ipairs(MODES) do
-    local mb=Instance.new("TextButton")
-    mb.Size=UDim2.new(0,modeW-4,0,26) mb.Position=UDim2.new(0,(i-1)*modeW+2,0,4)
-    mb.BackgroundColor3=mname=="Formation" and modeColors[mname] or C(30,10,20)
-    mb.TextColor3=C(255,220,230) mb.Font=Enum.Font.GothamBold
-    mb.TextSize=10 mb.Text=mname mb.BorderSizePixel=0 mb.ZIndex=8 mb.Parent=modeStrip
-    Instance.new("UICorner",mb).CornerRadius=UDim.new(0,7)
-    modeBtnList[mname]=mb
-    mb.MouseButton1Click:Connect(function()
-        currentMode=mname modeTime=0
-        modeLbl.Text="● "..mname
-        modeLbl.TextColor3=modeColors[mname] or C(255,200,220)
-        for _,n in ipairs(MODES) do modeBtnList[n].BackgroundColor3=n==mname and modeColors[n] or C(30,10,20) end
-        if mname=="Blackhole" then bhCenter=getSidePos(1) end
-        resetPartitions()
-        playSound("12221967")
+local title = Instance.new("TextLabel")
+title.Size               = UDim2.new(1,-50,1,0)
+title.Position           = UDim2.new(0,14,0,0)
+title.BackgroundTransparency = 1
+title.Text               = "◉  SINGULARITY"
+title.TextColor3         = C(200,140,255)
+title.TextSize           = 14
+title.Font               = Enum.Font.GothamBold
+title.TextXAlignment     = Enum.TextXAlignment.Left
+title.Parent             = hdr
+
+local xBtn = Instance.new("TextButton")
+xBtn.Size             = UDim2.new(0,28,0,28)
+xBtn.Position         = UDim2.new(1,-36,0.5,-14)
+xBtn.BackgroundColor3 = C(40,0,60)
+xBtn.BorderSizePixel  = 0
+xBtn.Text             = "✕"
+xBtn.TextColor3       = C(180,80,255)
+xBtn.TextSize         = 13
+xBtn.Font             = Enum.Font.GothamBold
+xBtn.Parent           = hdr
+Instance.new("UICorner", xBtn).CornerRadius = UDim.new(0,6)
+xBtn.MouseButton1Click:Connect(function() panel.Visible = false end)
+
+-- helpers
+local function mkLbl(parent, text, x, y, w, h, fs, col)
+    local l = Instance.new("TextLabel")
+    l.Size               = UDim2.new(0,w,0,h)
+    l.Position           = UDim2.new(0,x,0,y)
+    l.BackgroundTransparency = 1
+    l.Text               = text
+    l.TextColor3         = col or C(180,140,220)
+    l.TextSize           = fs or 11
+    l.Font               = Enum.Font.GothamBold
+    l.TextXAlignment     = Enum.TextXAlignment.Left
+    l.BorderSizePixel    = 0
+    l.ZIndex             = 8
+    l.Parent             = parent
+    return l
+end
+
+local function mkNumRow(parent, label, x, y, getV, setV, step, mn, mx)
+    mkLbl(parent, label, x, y+4, 100, 18, 10)
+
+    local dm = Instance.new("TextButton")
+    dm.Size             = UDim2.new(0,26,0,26)
+    dm.Position         = UDim2.new(0,x+106,0,y)
+    dm.BackgroundColor3 = C(30,0,60)
+    dm.BorderSizePixel  = 0
+    dm.Text             = "−"
+    dm.TextColor3       = C(200,160,255)
+    dm.TextSize         = 15
+    dm.Font             = Enum.Font.GothamBold
+    dm.ZIndex           = 8
+    dm.Parent           = parent
+    Instance.new("UICorner",dm).CornerRadius=UDim.new(0,6)
+
+    local dv = Instance.new("TextLabel")
+    dv.Size             = UDim2.new(0,52,0,26)
+    dv.Position         = UDim2.new(0,x+136,0,y)
+    dv.BackgroundColor3 = C(16,6,30)
+    dv.BorderSizePixel  = 0
+    dv.Text             = tostring(getV())
+    dv.TextColor3       = C(220,190,255)
+    dv.TextSize         = 11
+    dv.Font             = Enum.Font.GothamBold
+    dv.ZIndex           = 8
+    dv.Parent           = parent
+    Instance.new("UICorner",dv).CornerRadius=UDim.new(0,5)
+
+    local dp = Instance.new("TextButton")
+    dp.Size             = UDim2.new(0,26,0,26)
+    dp.Position         = UDim2.new(0,x+192,0,y)
+    dp.BackgroundColor3 = C(50,0,100)
+    dp.BorderSizePixel  = 0
+    dp.Text             = "+"
+    dp.TextColor3       = C(200,160,255)
+    dp.TextSize         = 15
+    dp.Font             = Enum.Font.GothamBold
+    dp.ZIndex           = 8
+    dp.Parent           = parent
+    Instance.new("UICorner",dp).CornerRadius=UDim.new(0,6)
+
+    dm.MouseButton1Click:Connect(function()
+        setV(math.max(mn, getV()-step))
+        dv.Text=tostring(getV())
+    end)
+    dp.MouseButton1Click:Connect(function()
+        setV(math.min(mx, getV()+step))
+        dv.Text=tostring(getV())
     end)
 end
 
--- blackhole panel
-local bhPanel=mkFrame(Main,UDim2.new(1,-16,0,80),UDim2.new(0,8,0,84),C(8,8,12),0,6,10)
-mkStroke(bhPanel,C(60,0,100),1)
-mkLbl(bhPanel,"BLACKHOLE — tap/drag screen to move",UDim2.new(0,8,0,4),UDim2.new(1,-16,0,16),
-    10,C(160,120,255),Enum.Font.GothamBold,Enum.TextXAlignment.Left,8)
+-- enable button
+local enableBtn = Instance.new("TextButton")
+enableBtn.Size             = UDim2.new(1,-24,0,38)
+enableBtn.Position         = UDim2.new(0,12,0,48)
+enableBtn.BackgroundColor3 = C(20,6,40)
+enableBtn.BorderSizePixel  = 0
+enableBtn.Text             = "◉  ENABLE SINGULARITY"
+enableBtn.TextColor3       = C(160,100,220)
+enableBtn.TextSize         = 13
+enableBtn.Font             = Enum.Font.GothamBold
+enableBtn.ZIndex           = 8
+enableBtn.Parent           = panel
+Instance.new("UICorner",enableBtn).CornerRadius=UDim.new(0,10)
+local enStroke=Instance.new("UIStroke",enableBtn) enStroke.Thickness=1.5 enStroke.Color=C(80,0,160)
 
-local function numRow(parent,label,x,y,getV,setV,step,mn,mx)
-    mkLbl(parent,label,UDim2.new(0,x,0,y+4),UDim2.new(0.28,0,0,14),9,C(180,150,255))
-    local dm=mkBtn(parent,"−",UDim2.new(0,x+86,0,y),UDim2.new(0,22,0,22),C(40,20,80),C(200,180,255),13,4)
-    local dv=Instance.new("TextLabel")
-    dv.Size=UDim2.new(0,48,0,22) dv.Position=UDim2.new(0,x+112,0,y)
-    dv.Text=tostring(getV()) dv.BackgroundColor3=C(20,10,30) dv.TextColor3=C(220,200,255)
-    dv.Font=Enum.Font.GothamBold dv.TextSize=10 dv.BorderSizePixel=0 dv.ZIndex=8 dv.Parent=parent
-    Instance.new("UICorner",dv).CornerRadius=UDim.new(0,4)
-    local dp=mkBtn(parent,"+",UDim2.new(0,x+164,0,y),UDim2.new(0,22,0,22),C(60,20,100),C(200,180,255),13,4)
-    dm.MouseButton1Click:Connect(function() setV(math.max(mn,getV()-step)) dv.Text=tostring(getV()) end)
-    dp.MouseButton1Click:Connect(function() setV(math.min(mx,getV()+step)) dv.Text=tostring(getV()) end)
-end
+local statusLbl = mkLbl(panel,"tap screen to drag ball",12,92,256,16,9,C(100,70,150))
 
-numRow(bhPanel,"Suck Radius",6,22,function() return bhSuckRadius end,function(v) bhSuckRadius=v end,10,10,200)
-numRow(bhPanel,"Suck Force", 6,48,function() return bhSuckForce  end,function(v) bhSuckForce=v  end,20,10,500)
-mkLbl(bhPanel,"Spin",UDim2.new(0.65,0,0,22+4),UDim2.new(0.1,0,0,14),9,C(180,150,255))
-local spDv=Instance.new("TextLabel")
-spDv.Size=UDim2.new(0,36,0,22) spDv.Position=UDim2.new(0.72,4,0,22)
-spDv.Text="2.0" spDv.BackgroundColor3=C(20,10,30) spDv.TextColor3=C(220,200,255)
-spDv.Font=Enum.Font.GothamBold spDv.TextSize=10 spDv.BorderSizePixel=0 spDv.ZIndex=8 spDv.Parent=bhPanel
-Instance.new("UICorner",spDv).CornerRadius=UDim.new(0,4)
-local spM=mkBtn(bhPanel,"−",UDim2.new(0.65,0,0,22),UDim2.new(0,22,0,22),C(40,20,80),C(200,180,255),13,4)
-local spP=mkBtn(bhPanel,"+",UDim2.new(0.93,-22,0,22),UDim2.new(0,22,0,22),C(60,20,100),C(200,180,255),13,4)
-spM.MouseButton1Click:Connect(function() bhSpinSpeed=math.max(0.2,bhSpinSpeed-0.2) spDv.Text=string.format("%.1f",bhSpinSpeed) end)
-spP.MouseButton1Click:Connect(function() bhSpinSpeed=math.min(8,bhSpinSpeed+0.2) spDv.Text=string.format("%.1f",bhSpinSpeed) end)
-
--- count strip
-local countStrip=mkFrame(Main,UDim2.new(1,-16,0,36),UDim2.new(0,8,0,170),C(14,4,8),0,6,10)
-mkStroke(countStrip,C(80,0,40),1)
-mkLbl(countStrip,"COUNT",UDim2.new(0,6,0,2),UDim2.new(0.12,0,1,-4),9,C(200,120,140))
-local countColors={C(176,18,34),C(18,105,176),C(15,138,68),C(168,112,16),C(136,48,192),C(192,112,16),C(16,136,136),C(192,64,128)}
-local cW=math.floor((PANEL_W-16-50)/8)
-local countBtnList={}
-for i=1,8 do
-    local cb=Instance.new("TextButton")
-    cb.Size=UDim2.new(0,cW-3,0,26) cb.Position=UDim2.new(0,48+(i-1)*cW,0,5)
-    cb.BackgroundColor3=countColors[i] cb.TextColor3=C(255,255,255)
-    cb.Font=Enum.Font.GothamBold cb.TextSize=12 cb.Text=tostring(i)
-    cb.BorderSizePixel=0 cb.ZIndex=8 cb.Parent=countStrip
-    Instance.new("UICorner",cb).CornerRadius=UDim.new(0,7)
-    countBtnList[i]=cb
-    cb.MouseButton1Click:Connect(function()
-        activeSwordCount=i
-        for j=1,8 do
-            swords[j].enabled=(j<=i)
-            countBtnList[j].BackgroundColor3=j<=i and countColors[j] or C(40,14,22)
-        end
-        resetPartitions()
-        playSound("12221967")
-    end)
-end
-
--- global yaw/pitch
-local rotStrip=mkFrame(Main,UDim2.new(1,-16,0,36),UDim2.new(0,8,0,212),C(14,4,8),0,6,10)
-mkStroke(rotStrip,C(80,0,40),1)
-mkLbl(rotStrip,"ALL YAW",UDim2.new(0,6,0,2),UDim2.new(0.14,0,1,-4),9,C(200,120,140))
-local allYawDeg=0 local allPitchDeg=0
-local yDm=mkBtn(rotStrip,"−",UDim2.new(0.16,0,0,6),UDim2.new(0.08,0,0,24),C(80,20,0),C(255,220,220),13,5)
-local yDv=Instance.new("TextLabel") yDv.Size=UDim2.new(0.12,0,0,24) yDv.Position=UDim2.new(0.25,0,0,6)
-yDv.Text="0°" yDv.BackgroundColor3=C(25,5,5) yDv.TextColor3=C(255,200,200)
-yDv.Font=Enum.Font.GothamBold yDv.TextSize=11 yDv.BorderSizePixel=0 yDv.ZIndex=8 yDv.Parent=rotStrip
-Instance.new("UICorner",yDv).CornerRadius=UDim.new(0,4)
-local yDp=mkBtn(rotStrip,"+",UDim2.new(0.38,0,0,6),UDim2.new(0.08,0,0,24),C(120,20,0),C(255,220,220),13,5)
-yDm.MouseButton1Click:Connect(function() allYawDeg=(allYawDeg-15+360)%360 yDv.Text=allYawDeg.."°" for _,sw in ipairs(swords) do if sw.enabled then sw.yaw=math.rad(allYawDeg) end end end)
-yDp.MouseButton1Click:Connect(function() allYawDeg=(allYawDeg+15)%360 yDv.Text=allYawDeg.."°" for _,sw in ipairs(swords) do if sw.enabled then sw.yaw=math.rad(allYawDeg) end end end)
-mkLbl(rotStrip,"PITCH",UDim2.new(0.50,0,0,2),UDim2.new(0.10,0,1,-4),9,C(200,120,140))
-local pDm=mkBtn(rotStrip,"−",UDim2.new(0.61,0,0,6),UDim2.new(0.08,0,0,24),C(80,20,0),C(255,220,220),13,5)
-local pDv=Instance.new("TextLabel") pDv.Size=UDim2.new(0.12,0,0,24) pDv.Position=UDim2.new(0.70,0,0,6)
-pDv.Text="0°" pDv.BackgroundColor3=C(25,5,5) pDv.TextColor3=C(255,200,200)
-pDv.Font=Enum.Font.GothamBold pDv.TextSize=11 pDv.BorderSizePixel=0 pDv.ZIndex=8 pDv.Parent=rotStrip
-Instance.new("UICorner",pDv).CornerRadius=UDim.new(0,4)
-local pDp=mkBtn(rotStrip,"+",UDim2.new(0.83,0,0,6),UDim2.new(0.08,0,0,24),C(120,20,0),C(255,220,220),13,5)
-pDm.MouseButton1Click:Connect(function() allPitchDeg=math.clamp(allPitchDeg-15,-80,80) pDv.Text=allPitchDeg.."°" for _,sw in ipairs(swords) do if sw.enabled then sw.pitch=math.rad(allPitchDeg) end end end)
-pDp.MouseButton1Click:Connect(function() allPitchDeg=math.clamp(allPitchDeg+15,-80,80) pDv.Text=allPitchDeg.."°" for _,sw in ipairs(swords) do if sw.enabled then sw.pitch=math.rad(allPitchDeg) end end end)
-
--- sword cards
-local CARD_W=104 local CARD_H=72 local CARD_GAP=4
-local cardGrid=mkFrame(Main,
-    UDim2.new(1,-16,0,CARD_H*2+CARD_GAP*3),
-    UDim2.new(0,8,0,254),C(10,2,6),0,6,10)
-mkStroke(cardGrid,C(60,0,30),1)
-
-local SWORD_NAMES={"Ⅰ","Ⅱ","Ⅲ","Ⅳ","Ⅴ","Ⅵ","Ⅶ","Ⅷ"}
-local SWORD_COLORS={C(176,18,34),C(18,105,176),C(15,138,68),C(168,112,16),C(136,48,192),C(192,112,16),C(16,136,136),C(192,64,128)}
-local ptLabels={}
-
-for i=1,SWORD_COUNT do
-    local col=(i-1)%4 local row=math.floor((i-1)/4)
-    local cx=CARD_GAP+col*(CARD_W+CARD_GAP)
-    local cy=CARD_GAP+row*(CARD_H+CARD_GAP)
-    local sw=swords[i]
-    local card=mkFrame(cardGrid,UDim2.new(0,CARD_W,0,CARD_H),UDim2.new(0,cx,0,cy),C(18,5,10),0,7,8)
-    local hdr=mkFrame(card,UDim2.new(1,0,0,20),UDim2.new(0,0,0,0),SWORD_COLORS[i],0,8,8)
-    mkLbl(hdr,SWORD_NAMES[i],UDim2.new(0,6,0,0),UDim2.new(0.5,0,1,0),12,C(255,255,255),Enum.Font.Fondamento,Enum.TextXAlignment.Left,9)
-    local ptL=mkLbl(hdr,"0p",UDim2.new(0.5,0,0,0),UDim2.new(0.48,0,1,0),9,C(255,230,230),Enum.Font.GothamBold,Enum.TextXAlignment.Right,9)
-    ptLabels[i]=ptL
-    local yd=mkBtn(card,"−",UDim2.new(0.02,0,0,22),UDim2.new(0.2,0,0,18),C(70,15,0),C(255,220,220),12,4)
-    local yv=Instance.new("TextLabel") yv.Size=UDim2.new(0.3,0,0,18) yv.Position=UDim2.new(0.23,0,0,22)
-    yv.Text="Y0°" yv.BackgroundColor3=C(20,4,4) yv.TextColor3=C(255,200,200) yv.Font=Enum.Font.GothamBold yv.TextSize=9 yv.BorderSizePixel=0 yv.ZIndex=8 yv.Parent=card
-    Instance.new("UICorner",yv).CornerRadius=UDim.new(0,3)
-    local yu=mkBtn(card,"+",UDim2.new(0.56,0,0,22),UDim2.new(0.2,0,0,18),C(110,15,0),C(255,220,220),12,4)
-    local pd=mkBtn(card,"−",UDim2.new(0.02,0,0,44),UDim2.new(0.2,0,0,18),C(70,15,0),C(255,220,220),12,4)
-    local pv=Instance.new("TextLabel") pv.Size=UDim2.new(0.3,0,0,18) pv.Position=UDim2.new(0.23,0,0,44)
-    pv.Text="P0°" pv.BackgroundColor3=C(20,4,4) pv.TextColor3=C(255,200,200) pv.Font=Enum.Font.GothamBold pv.TextSize=9 pv.BorderSizePixel=0 pv.ZIndex=8 pv.Parent=card
-    Instance.new("UICorner",pv).CornerRadius=UDim.new(0,3)
-    local pu=mkBtn(card,"+",UDim2.new(0.56,0,0,44),UDim2.new(0.2,0,0,18),C(110,15,0),C(255,220,220),12,4)
-    local swYDeg=0 local swPDeg=0
-    yd.MouseButton1Click:Connect(function() swYDeg=(swYDeg-15+360)%360 sw.yaw=math.rad(swYDeg) yv.Text="Y"..swYDeg.."°" end)
-    yu.MouseButton1Click:Connect(function() swYDeg=(swYDeg+15)%360 sw.yaw=math.rad(swYDeg) yv.Text="Y"..swYDeg.."°" end)
-    pd.MouseButton1Click:Connect(function() swPDeg=math.clamp(swPDeg-15,-80,80) sw.pitch=math.rad(swPDeg) pv.Text="P"..swPDeg.."°" end)
-    pu.MouseButton1Click:Connect(function() swPDeg=math.clamp(swPDeg+15,-80,80) sw.pitch=math.rad(swPDeg) pv.Text="P"..swPDeg.."°" end)
-end
-
--- part count refresh
-local _pc=0
-RunService.Heartbeat:Connect(function(dt)
-    _pc=_pc+dt if _pc<0.5 then return end _pc=0
-    for i,sw in ipairs(swords) do
-        if ptLabels[i] then ptLabels[i].Text=(#sw.parts).."p" end
+local function setEnabled(v)
+    CFG.enabled = v
+    if v then
+        enableBtn.Text             = "◉  DISABLE SINGULARITY"
+        enableBtn.TextColor3       = C(220,180,255)
+        enableBtn.BackgroundColor3 = C(50,0,100)
+        enStroke.Color             = C(160,60,255)
+        statusLbl.Text             = "● active — drag to move ball"
+        statusLbl.TextColor3       = C(140,255,140)
+        -- init ball beside player
+        ballPos   = humanoidRootPart.Position + Vector3.new(0,0,-12)
+        dragPlaneY= ballPos.Y
+        lastTrailPos = ballPos
+    else
+        enableBtn.Text             = "◉  ENABLE SINGULARITY"
+        enableBtn.TextColor3       = C(160,100,220)
+        enableBtn.BackgroundColor3 = C(20,6,40)
+        enStroke.Color             = C(80,0,160)
+        statusLbl.Text             = "● inactive"
+        statusLbl.TextColor3       = C(100,70,150)
+        -- release all parts
+        getgenv().SingNet.parts = {}
     end
-end)
-
--- status
-local statusBar=mkFrame(Main,UDim2.new(1,-16,0,22),UDim2.new(0,8,0,PANEL_H-28),C(12,3,8),0,6,8)
-local statusLbl=mkLbl(statusBar,"● Ready",UDim2.new(0,6,0,0),UDim2.new(1,-12,1,0),
-    9,C(160,100,130),Enum.Font.GothamBold,Enum.TextXAlignment.Left,8)
-RunService.Heartbeat:Connect(function()
-    local total=0 for _,sw in ipairs(swords) do total=total+#sw.parts end
-    statusLbl.Text="● "..currentMode.." · "..total.." parts · "..activeSwordCount.." active · 45st left"
-end)
-
--- ─── Blackhole finger drag ────────────────────────────────────────────────────
-local function screenToWorldBH(sp)
-    local cam=Workspace.CurrentCamera if not cam then return nil end
-    local ray=cam:ScreenPointToRay(sp.X,sp.Y)
-    local d=ray.Direction
-    local planeY=bhCenter.Y
-    if math.abs(d.Y)<0.0001 then return nil end
-    local t=(planeY-ray.Origin.Y)/d.Y
-    if t<=0 then return nil end
-    return ray.Origin+d*t
 end
 
-overlay.InputBegan:Connect(function(inp)
-    if currentMode~="Blackhole" then return end
-    if inp.UserInputType~=Enum.UserInputType.Touch
-    and inp.UserInputType~=Enum.UserInputType.MouseButton1 then return end
-    if bhDragging then return end
-    bhDragging=true bhDragTouch=inp
-    local wp=screenToWorldBH(Vector2.new(inp.Position.X,inp.Position.Y))
-    if wp then bhCenter=Vector3.new(wp.X,bhCenter.Y,wp.Z) end
+enableBtn.MouseButton1Click:Connect(function() setEnabled(not CFG.enabled) end)
+
+-- divider
+local div = Instance.new("Frame")
+div.Size             = UDim2.new(1,-24,0,1)
+div.Position         = UDim2.new(0,12,0,114)
+div.BackgroundColor3 = C(60,0,120)
+div.BorderSizePixel  = 0
+div.Parent           = panel
+
+-- number controls
+mkLbl(panel,"PULL RADIUS",12,122,120,14,9,C(120,80,180))
+mkNumRow(panel,"",  12,136,
+    function() return CFG.pullRadius end,
+    function(v) CFG.pullRadius=v ballLight.Range=v*0.4 end,
+    5,10,300)
+
+mkLbl(panel,"PULL FORCE",12,170,120,14,9,C(120,80,180))
+mkNumRow(panel,"",  12,184,
+    function() return CFG.pullForce end,
+    function(v) CFG.pullForce=v end,
+    10,10,600)
+
+mkLbl(panel,"BALL SIZE",12,218,120,14,9,C(120,80,180))
+mkNumRow(panel,"",  12,232,
+    function() return CFG.ballRadius end,
+    function(v)
+        CFG.ballRadius=v
+        ballPart.Size=Vector3.new(v*2,v*2,v*2)
+    end,
+    1,1,30)
+
+mkLbl(panel,"TRAIL LIFE (s)",12,266,120,14,9,C(120,80,180))
+mkNumRow(panel,"",  12,280,
+    function() return CFG.trailLifetime end,
+    function(v) CFG.trailLifetime=v end,
+    1,1,30)
+
+-- clear trail button
+local clearBtn = Instance.new("TextButton")
+clearBtn.Size             = UDim2.new(1,-24,0,26)
+clearBtn.Position         = UDim2.new(0,12,1,-36)
+clearBtn.BackgroundColor3 = C(30,0,50)
+clearBtn.BorderSizePixel  = 0
+clearBtn.Text             = "✕  CLEAR TRAIL"
+clearBtn.TextColor3       = C(180,80,255)
+clearBtn.TextSize         = 11
+clearBtn.Font             = Enum.Font.GothamBold
+clearBtn.ZIndex           = 8
+clearBtn.Parent           = panel
+Instance.new("UICorner",clearBtn).CornerRadius=UDim.new(0,8)
+clearBtn.MouseButton1Click:Connect(function()
+    for _,v in ipairs(trailFolder:GetChildren()) do v:Destroy() end
 end)
 
-UserInputService.InputChanged:Connect(function(inp)
-    if currentMode~="Blackhole" then return end
-    if not bhDragging or inp~=bhDragTouch then return end
-    if inp.UserInputType~=Enum.UserInputType.Touch
-    and inp.UserInputType~=Enum.UserInputType.MouseMovement then return end
-    local wp=screenToWorldBH(Vector2.new(inp.Position.X,inp.Position.Y))
+-- mini pill (when panel hidden)
+local pill = Instance.new("TextButton")
+pill.Size             = UDim2.new(0,130,0,32)
+pill.Position         = UDim2.new(0,12,0.5,-16)
+pill.BackgroundColor3 = C(12,4,24)
+pill.BorderSizePixel  = 0
+pill.Text             = "◉ SINGULARITY"
+pill.TextColor3       = C(140,80,200)
+pill.TextSize         = 11
+pill.Font             = Enum.Font.GothamBold
+pill.ZIndex           = 8
+pill.Parent           = sg
+Instance.new("UICorner",pill).CornerRadius=UDim.new(0,10)
+local pillS=Instance.new("UIStroke",pill) pillS.Thickness=1.2 pillS.Color=C(80,0,140)
+pill.MouseButton1Click:Connect(function() panel.Visible=not panel.Visible end)
+
+-- ─── Drag input ───────────────────────────────────────────────────────────────
+
+dragOverlay.InputBegan:Connect(function(inp, gpe)
+    if gpe then return end
+    if not CFG.enabled then return end
+    if inp.UserInputType ~= Enum.UserInputType.Touch
+    and inp.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
+    if dragging then return end
+
+    dragging   = true
+    dragTouch  = inp
+    dragPlaneY = ballPos.Y
+
+    local wp = screenToWorld(Vector2.new(inp.Position.X, inp.Position.Y), dragPlaneY)
     if wp then
-        bhCenter=Vector3.new(wp.X,bhCenter.Y,wp.Z)
-        for i,sw in ipairs(swords) do
-            if sw.enabled then
-                sw.centerPos=getBlackholePos(i,modeTime)
-                sw.anchor.Position=sw.centerPos
-            end
-        end
-    end
-end)
-
-UserInputService.InputEnded:Connect(function(inp)
-    if inp==bhDragTouch then bhDragging=false bhDragTouch=nil end
-end)
-
--- ─── Per-sword finger drag (non-blackhole) ────────────────────────────────────
-local touchToSword={} local swordDragY={}
-
-local function screenToWorldSW(sp,planeY)
-    local cam=Workspace.CurrentCamera if not cam then return nil end
-    local ray=cam:ScreenPointToRay(sp.X,sp.Y)
-    local d=ray.Direction
-    if math.abs(d.Y)<0.0001 then return ray.Origin+d*200 end
-    local t=(planeY-ray.Origin.Y)/d.Y
-    if t<=0 then return ray.Origin+d*200 end
-    return ray.Origin+d*t
-end
-
-overlay.InputBegan:Connect(function(inp)
-    if currentMode=="Blackhole" then return end
-    if inp.UserInputType~=Enum.UserInputType.Touch
-    and inp.UserInputType~=Enum.UserInputType.MouseButton1 then return end
-    for i,sw in ipairs(swords) do
-        if sw.enabled and not sw.fingerActive then
-            sw.fingerActive=true sw.fingerTouch=inp
-            touchToSword[inp]=i swordDragY[i]=sw.centerPos.Y
-            local wp=screenToWorldSW(Vector2.new(inp.Position.X,inp.Position.Y),swordDragY[i])
-            if wp then
-                sw.centerPos=Vector3.new(wp.X,swordDragY[i],wp.Z)
-                sw.anchor.Position=sw.centerPos
-            end
-            break
-        end
+        ballPos      = Vector3.new(wp.X, dragPlaneY, wp.Z)
+        lastTrailPos = ballPos
+        ballPart.Position = ballPos
     end
 end)
 
 UserInputService.InputChanged:Connect(function(inp)
-    if currentMode=="Blackhole" then return end
-    local i=touchToSword[inp] if not i then return end
-    local sw=swords[i] if not sw or not sw.fingerActive then return end
-    if inp.UserInputType~=Enum.UserInputType.Touch
-    and inp.UserInputType~=Enum.UserInputType.MouseMovement then return end
-    local wp=screenToWorldSW(Vector2.new(inp.Position.X,inp.Position.Y),swordDragY[i] or sw.centerPos.Y)
+    if not dragging or inp ~= dragTouch then return end
+    if inp.UserInputType ~= Enum.UserInputType.Touch
+    and inp.UserInputType ~= Enum.UserInputType.MouseMovement then return end
+
+    local wp = screenToWorld(Vector2.new(inp.Position.X, inp.Position.Y), dragPlaneY)
     if wp then
-        sw.centerPos=Vector3.new(wp.X,swordDragY[i],wp.Z)
-        sw.anchor.Position=sw.centerPos
+        ballPos = Vector3.new(wp.X, dragPlaneY, wp.Z)
+        ballPart.Position = ballPos
     end
 end)
 
 UserInputService.InputEnded:Connect(function(inp)
-    if currentMode=="Blackhole" then return end
-    local i=touchToSword[inp] if not i then return end
-    local sw=swords[i]
-    if sw then
-        sw.fingerActive=false sw.fingerTouch=nil swordDragY[i]=nil
-        sw.centerPos=getTargetPos(i,modeTime)
-        sw.anchor.Position=sw.centerPos
+    if inp == dragTouch then
+        dragging  = false
+        dragTouch = nil
     end
-    touchToSword[inp]=nil
 end)
 
 -- ─── Respawn ──────────────────────────────────────────────────────────────────
 LocalPlayer.CharacterAdded:Connect(function(nc)
-    character=nc
-    humanoidRootPart=nc:WaitForChild("HumanoidRootPart")
-    humanoid=nc:WaitForChild("Humanoid")
-    task.wait(0.1)
-    bhCenter=getSidePos(1)
-    for i,sw in ipairs(swords) do
-        if sw.enabled then
-            sw.centerPos=getTargetPos(i,0)
-            sw.anchor.Position=sw.centerPos
-        end
+    character        = nc
+    humanoidRootPart = nc:WaitForChild("HumanoidRootPart")
+    getgenv().SingNet.parts = {}
+    if CFG.enabled then
+        ballPos    = humanoidRootPart.Position + Vector3.new(0,0,-12)
+        dragPlaneY = ballPos.Y
+        lastTrailPos = ballPos
     end
-    resetPartitions()
 end)
 
 -- ─── Boot ─────────────────────────────────────────────────────────────────────
-bhCenter=getSidePos(1)
-resetPartitions()
 pcall(function()
     StarterGui:SetCore("SendNotification",{
-        Title="Devil's Blade v4",
-        Text="45st camera-left · 6 modes · Blackhole finger drag",
-        Duration=4,
+        Title="Singularity",
+        Text="1 ball · pulls all parts · finger drag · trail",
+        Duration=3,
     })
 end)
-playSound("12221967")
